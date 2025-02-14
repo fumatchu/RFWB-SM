@@ -1,171 +1,107 @@
 #!/bin/bash
 
-# Define color codes for pretty output
+# Define color codes for output
+RESET="\033[0m"
 GREEN="\033[0;32m"
 RED="\033[0;31m"
 YELLOW="\033[1;33m"
-TEXTRESET="\033[0m"
 
-# Function to find the interface ending with a specific suffix
+# Function to find the network interface based on connection name ending
 find_interface() {
     local suffix="$1"
-    interface=$(nmcli device status | awk -v suffix="$suffix" '$0 ~ suffix {print $1}')
+    nmcli -t -f DEVICE,CONNECTION device status | awk -F: -v suffix="$suffix" '$2 ~ suffix {print $1}'
+}
 
-    if [ -z "$interface" ]; then
-        echo -e "${RED}Error: No interface with a connection ending in '$suffix' found.${TEXTRESET}"
+# Setup the FW: Determine inside and outside interfaces
+echo -e "${YELLOW}Determining network interfaces...${RESET}"
+INSIDE_INTERFACE=$(find_interface "-inside")
+OUTSIDE_INTERFACE=$(find_interface "-outside")
+
+echo -e "${GREEN}Inside interface: $INSIDE_INTERFACE${RESET}"
+echo -e "${GREEN}Outside interface: $OUTSIDE_INTERFACE${RESET}"
+
+if [[ -z "$INSIDE_INTERFACE" || -z "$OUTSIDE_INTERFACE" ]]; then
+    echo -e "${RED}Error: Could not determine one or both interfaces. Please check your connection names.${RESET}"
+    exit 1
+fi
+
+# Ensure nftables tables and chains exist
+sudo nft add table ip nat
+sudo nft add chain ip nat prerouting { type nat hook prerouting priority 0\; }
+sudo nft add chain ip nat postrouting { type nat hook postrouting priority 100\; }
+sudo nft add table ip filter
+sudo nft add chain ip filter input { type filter hook input priority 0\; }
+
+# Get the IP address for the inside interface
+INSIDE_IP=$(nmcli -g IP4.ADDRESS device show "$INSIDE_INTERFACE" | head -n1 | cut -d'/' -f1)
+
+# Ask the user if they want to scan an internal device for open ports
+read -p "Do you want to scan an internal device for open ports? (yes/no): " scan_choice
+
+if [[ "$scan_choice" == "yes" ]]; then
+    read -p "Enter the IP address of the internal device: " device_ip
+    echo -e "${YELLOW}Scanning $device_ip for open ports... Please wait.${RESET}"
+
+    # Run nmap in verbose mode and display output while capturing open ports
+    nmap_output=$(mktemp)
+    nmap -sS -sU -p- --min-rate=1000 -T4 -v $device_ip | tee $nmap_output
+
+    # Extract open ports from the nmap output
+    open_ports=$(awk '/^[0-9]+\/(tcp|udp)/ && /open/ {print $1 "/" $2}' $nmap_output)
+
+    rm $nmap_output
+
+    if [ -z "$open_ports" ]; then
+        echo -e "${RED}No open ports found on $device_ip.${RESET}"
         exit 1
     fi
 
-    echo "$interface"
-}
+    echo -e "${GREEN}Open ports found:${RESET}"
+    echo "$open_ports" | nl
 
-# Function to find the zone associated with an interface
-find_zone() {
-    local interface="$1"
-    zone=$(sudo firewall-cmd --get-active-zones | awk -v iface="$interface" '
-        {
-            if ($1 != "" && $1 !~ /interfaces:/) { current_zone = $1 }
-        }
-        /^  interfaces:/ {
-            if ($0 ~ iface) { print current_zone }
-        }
-    ')
+    # Ask the user if they want to forward all ports or select specific ones
+    read -p "Do you want to port forward all open ports or select specific ones? (all/select): " forward_choice
 
-    if [ -z "$zone" ]; then
-        echo -e "${RED}Error: No zone associated with interface $interface.${TEXTRESET}"
-        exit 1
-    fi
-
-    echo "$zone"
-}
-
-# Function to get the primary service name or port information
-get_service_or_port_info() {
-    local port="$1"
-    local protocol="$2"
-    local service_name=""
-    local spinner="/-\|"
-
-    # Start background search and spinner
-    (
-        # Priority list of common services
-        local priority_services=("http" "https" "ftp" "ssh" "telnet" "smtp" "pop3" "imap" "dns")
-
-        # Check priority services first
-        for service in "${priority_services[@]}"; do
-            if sudo firewall-cmd --info-service="$service" 2>/dev/null | grep -q "ports:.*\b$port/$protocol\b"; then
-                service_name="$service"
-                break
-            fi
+    if [[ "$forward_choice" == "all" ]]; then
+        echo -e "${YELLOW}Applying port forwarding rules for all open ports...${RESET}"
+        for port in $open_ports; do
+            port_number=$(echo "$port" | cut -d'/' -f1)
+            protocol=$(echo "$port" | cut -d'/' -f2)
+            echo "Applying rule for port $port_number/$protocol"
+            sudo nft add rule ip nat prerouting iif $OUTSIDE_INTERFACE $protocol dport $port_number counter dnat to $device_ip:$port_number
+            sudo nft add rule ip filter input iif $OUTSIDE_INTERFACE $protocol dport $port_number accept
+        done
+    elif [[ "$forward_choice" == "select" ]]; then
+        selected_ports=()
+        echo "Enter the number of the port you want to forward (e.g., 1,2,3), separated by spaces:"
+        read -a port_numbers
+        echo -e "${YELLOW}Applying port forwarding rules for selected ports...${RESET}"
+        for number in "${port_numbers[@]}"; do
+            port=$(echo "$open_ports" | sed -n "${number}p")
+            selected_ports+=("$port")
         done
 
-        # If not found in priority list, check all services
-        if [ -z "$service_name" ]; then
-            service_name=$(sudo firewall-cmd --get-services | tr ' ' '\n' | while read -r service; do
-                if sudo firewall-cmd --info-service="$service" 2>/dev/null | grep -q "ports:.*\b$port/$protocol\b"; then
-                    echo "$service"
-                    break
-                fi
-            done)
-        fi
-        echo "$service_name" > /tmp/service_name_result.txt
-    ) &
-
-    local search_pid=$!
-    local delay=0.1
-    local elapsed=0
-    local timeout=2
-
-    echo -ne "${YELLOW}Please wait while we attempt to find the service... ${TEXTRESET}"
-    while kill -0 $search_pid 2>/dev/null; do
-        printf "\b${spinner:elapsed%4:1}"
-        elapsed=$((elapsed + 1))
-        sleep $delay
-    done
-    wait $search_pid
-
-    service_name=$(< /tmp/service_name_result.txt)
-
-    if [ -n "$service_name" ]; then
-        echo -e "\n${GREEN}Port $port/$protocol is associated with the '$service_name' protocol.${TEXTRESET}"
-        return 0
-    else
-        echo -e "\n${RED}Port $port/$protocol is not associated with a known service.${TEXTRESET}"
-        return 1
-    fi
-}
-
-# Function to create a new service
-create_new_service() {
-    local port="$1"
-    local protocol="$2"
-
-    echo -e "${YELLOW}Enter the name for the new service:${TEXTRESET}"
-    read -r service_name
-    service_name=$(echo "$service_name" | tr '[:upper:]' '[:lower:]')
-
-    echo -e "${YELLOW}Enter the description for the new service:${TEXTRESET}"
-    read -r service_description
-
-    sudo firewall-cmd --permanent --new-service="$service_name"
-    sudo firewall-cmd --permanent --service="$service_name" --set-description="$service_description"
-    sudo firewall-cmd --permanent --service="$service_name" --add-port="$port/$protocol"
-    sudo firewall-cmd --reload
-
-    echo -e "${GREEN}New service '$service_name' created with port $port/$protocol.${TEXTRESET}"
-}
-
-# Main execution block
-outside_interface=$(find_interface "-outside")
-inside_interface=$(find_interface "-inside")
-
-outside_zone=$(find_zone "$outside_interface")
-inside_zone=$(find_zone "$inside_interface")
-
-echo -e "${YELLOW}Outside Interface: $outside_interface, Zone: $outside_zone${TEXTRESET}"
-echo -e "${YELLOW}Inside Interface: $inside_interface, Zone: $inside_zone${TEXTRESET}"
-
-# Ask the user if they want to set up port forwarding
-echo -e "${YELLOW}Would you like to set up port forwarding? (yes/no)${TEXTRESET}"
-read -r setup_forwarding
-
-if [[ "$setup_forwarding" =~ ^[Yy][Ee][Ss]$ || "$setup_forwarding" =~ ^[Yy]$ ]]; then
-    # Ask for the external port/service
-    echo -e "${YELLOW}Enter the external port to open on the outside zone:${TEXTRESET}"
-    read -r external_port
-
-    echo -e "${YELLOW}Enter the protocol (tcp/udp) for the external port:${TEXTRESET}"
-    read -r external_protocol
-    external_protocol=$(echo "$external_protocol" | tr '[:upper:]' '[:lower:]')
-
-    # Provide information about the entered port and protocol
-    if ! get_service_or_port_info "$external_port" "$external_protocol"; then
-        create_new_service "$external_port" "$external_protocol"
+        for port in "${selected_ports[@]}"; do
+            port_number=$(echo "$port" | cut -d'/' -f1)
+            protocol=$(echo "$port" | cut -d'/' -f2)
+            echo "Applying rule for port $port_number/$protocol"
+            sudo nft add rule ip nat prerouting iif $OUTSIDE_INTERFACE $protocol dport $port_number counter dnat to $device_ip:$port_number
+            sudo nft add rule ip filter input iif $OUTSIDE_INTERFACE $protocol dport $port_number accept
+        done
     fi
 
-    # Ask for the internal port/service
-    echo -e "${YELLOW}Enter the internal port to bind on the inside zone:${TEXTRESET}"
-    read -r internal_port
-
-    echo -e "${YELLOW}Enter the protocol (tcp/udp) for the internal port:${TEXTRESET}"
-    read -r internal_protocol
-    internal_protocol=$(echo "$internal_protocol" | tr '[:upper:]' '[:lower:]')
-
-    # Provide information about the entered port and protocol
-    if ! get_service_or_port_info "$internal_port" "$internal_protocol"; then
-        create_new_service "$internal_port" "$internal_protocol"
-    fi
-
-    # Ask for the internal IP address
-    echo -e "${YELLOW}Enter the IP address of the device hosting the service internally:${TEXTRESET}"
-    read -r internal_ip
-
-    # Set up port forwarding using firewall-cmd
-    sudo firewall-cmd --zone="$outside_zone" --add-forward-port=port="$external_port":proto="$external_protocol":toaddr="$internal_ip":toport="$internal_port" --permanent
-    sudo firewall-cmd --zone="$inside_zone" --add-forward-port=port="$internal_port":proto="$internal_protocol":toaddr="$internal_ip" --permanent
-    sudo firewall-cmd --reload
-
-    echo -e "${GREEN}Port forwarding set up successfully from $external_port/$external_protocol on $outside_zone to $internal_port/$internal_protocol on $inside_zone at $internal_ip.${TEXTRESET}"
 else
-    echo -e "${GREEN}No port forwarding configured.${TEXTRESET}"
+    # If user selects no to scanning, ask for manual input
+    read -p "Enter the IP address for port forwarding: " manual_ip
+    read -p "Enter the port number to forward: " manual_port
+    read -p "Enter the protocol (tcp/udp): " manual_protocol
+
+    echo -e "${YELLOW}Applying manual port forwarding rule...${RESET}"
+    sudo nft add rule ip nat prerouting iif $OUTSIDE_INTERFACE $manual_protocol dport $manual_port counter dnat to $manual_ip:$manual_port
+    sudo nft add rule ip filter input iif $OUTSIDE_INTERFACE $manual_protocol dport $manual_port accept
 fi
+
+# Save the nftables configuration
+echo -e "${YELLOW}Saving nftables configuration...${RESET}"
+sudo nft list ruleset > /etc/sysconfig/nftables.conf
+echo -e "${GREEN}Configuration saved successfully to /etc/sysconfig/nftables.conf!${RESET}"
