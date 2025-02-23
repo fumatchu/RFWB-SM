@@ -16,7 +16,10 @@ while IFS= read -r line; do
     if [[ $line =~ zone[[:space:]]+\"([^\"]+)\" ]]; then
         current_zone="${BASH_REMATCH[1]}"
     elif [[ -n $current_zone && $line =~ file[[:space:]]+\"([^\"]+)\" ]]; then
-        ZONES["$current_zone"]="${BASH_REMATCH[1]}"
+        # Exclude the root zone (.)
+        if [[ $current_zone != "." ]]; then
+            ZONES["$current_zone"]="${BASH_REMATCH[1]}"
+        fi
         current_zone=""
     fi
 done < "$NAMED_CONF"
@@ -26,10 +29,26 @@ if [[ ${#ZONES[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# List available zones
-echo "Available zones:"
-select zone in "${!ZONES[@]}"; do
-    if [[ -n $zone ]]; then
+# Freeze all zones
+echo "Freezing all zones:"
+for zone in "${!ZONES[@]}"; do
+    echo "Freezing zone: $zone"
+    rndc freeze "$zone"
+done
+
+# List available zones with an exit option
+echo "Available zones (type 'Exit' to quit):"
+select zone in "${!ZONES[@]}" "Exit"; do
+    if [[ $zone == "Exit" ]]; then
+        echo "Exiting script."
+        # Thaw all zones before exiting
+        echo "Thawing all zones:"
+        for z in "${!ZONES[@]}"; do
+            echo "Thawing zone: $z"
+            rndc thaw "$z"
+        done
+        exit 0
+    elif [[ -n $zone ]]; then
         echo "You selected zone: $zone"
         db_file="${ZONES[$zone]}"
         echo "Database file: $db_file"
@@ -45,10 +64,16 @@ if [[ ! -f $db_file ]]; then
     exit 1
 fi
 
+# Display the contents of the database file
+echo "Current contents of $db_file:"
+cat "$db_file"
+echo "-----------------------------------"
+
 # Function to increment the serial number in a zone file
 increment_serial() {
     local file="$1"
-    awk '/[0-9]+[[:space:]]*;[[:space:]]*serial/ { sub(/[0-9]+/, $1+1, $0) } { print }' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+    awk '/[0-9]+[[:space:]]*;[[:space:]]*serial/ { sub(/[0-9]+/, $1+1, $0) } { print }' "$file" > "$file.tmp" && mv "$file.tmp" "$
+file"
 }
 
 # Function to determine the reverse zone for an IP address
@@ -57,9 +82,7 @@ determine_reverse_zone() {
     IFS='.' read -r -a ip_parts <<< "$ip"
 
     for reverse_zone in "${!ZONES[@]}"; do
-        # Reverse the IP address to match the in-addr.arpa structure
         reverse_prefix="${ip_parts[2]}.${ip_parts[1]}.${ip_parts[0]}"
-        # Check if the reverse zone matches
         if [[ $reverse_zone == *"${reverse_prefix}.in-addr.arpa" ]]; then
             echo "$reverse_zone"
             return
@@ -79,15 +102,11 @@ edit_zone_file() {
             echo "Enter the IP address for the A record:"
             read ip
             echo "$name IN A $ip" >> "$db_file"
-
-            # Increment the serial number of the forward zone
             increment_serial "$db_file"
 
-            # Ask if user wants to create a PTR record
             echo "Do you want to create a PTR record for $ip? (yes/no)"
             read create_ptr
             if [[ $create_ptr == "yes" ]]; then
-                # Determine the reverse zone
                 reverse_zone=$(determine_reverse_zone "$ip")
                 if [[ -n $reverse_zone ]]; then
                     reverse_db_file="${ZONES[$reverse_zone]}"
@@ -136,15 +155,28 @@ edit_zone_file() {
     esac
 }
 
-# Freeze the zone before making changes
-echo "Freezing zone $zone..."
-rndc freeze "$zone"
+# Present options to create a new record based on the zone type
+if [[ $zone == *.in-addr.arpa ]]; then
+    # Options for reverse zones
+    echo "Select the type of record to create (type 'Exit' to quit):"
+    options=("PTR" "Exit")
+else
+    # Options for forward zones
+    echo "Select the type of record to create (type 'Exit' to quit):"
+    options=("A" "CNAME" "SRV" "Exit")
+fi
 
-# Present options to create a new record
-echo "Select the type of record to create:"
-options=("A" "CNAME" "SRV" "PTR")
 select opt in "${options[@]}"; do
-    if [[ -n $opt ]]; then
+    if [[ $opt == "Exit" ]]; then
+        echo "Exiting script."
+        # Thaw all zones before exiting
+        echo "Thawing all zones:"
+        for z in "${!ZONES[@]}"; do
+            echo "Thawing zone: $z"
+            rndc thaw "$z"
+        done
+        exit 0
+    elif [[ -n $opt ]]; then
         echo "You selected: $opt"
         edit_zone_file "$opt"
         break
@@ -160,14 +192,15 @@ cat "$db_file"
 echo "Do you accept these changes? (yes/no)"
 read confirmation
 
-if [[ $confirmation == "yes" ]]; then
-    # Thaw the zone after changes
-    echo "Thawing zone $zone..."
-    rndc thaw "$zone"
+# Thaw all zones
+echo "Thawing all zones:"
+for z in "${!ZONES[@]}"; do
+    echo "Thawing zone: $z"
+    rndc thaw "$z"
+done
 
+if [[ $confirmation == "yes" ]]; then
     echo "Zone $zone updated successfully."
 else
     echo "Changes discarded."
-    # Thaw the zone if no changes are made
-    rndc thaw "$zone"
 fi
