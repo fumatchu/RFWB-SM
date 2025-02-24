@@ -11,6 +11,7 @@ fi
 
 # Extract zones and their corresponding database files
 declare -A ZONES
+forward_zones=() # List to store forward zones
 current_zone=""
 while IFS= read -r line; do
     if [[ $line =~ zone[[:space:]]+\"([^\"]+)\" ]]; then
@@ -19,6 +20,10 @@ while IFS= read -r line; do
         # Exclude the root zone (.)
         if [[ $current_zone != "." ]]; then
             ZONES["$current_zone"]="${BASH_REMATCH[1]}"
+            # Populate forward zones list
+            if [[ $current_zone != *.in-addr.arpa ]]; then
+                forward_zones+=("$current_zone")
+            fi
         fi
         current_zone=""
     fi
@@ -64,10 +69,9 @@ if [[ ! -f $db_file ]]; then
     exit 1
 fi
 
-# Display the contents of the database file
-echo "Current contents of $db_file:"
-cat "$db_file"
-echo "-----------------------------------"
+# Create a temporary file for the zone file
+tmp_file=$(mktemp)
+cp "$db_file" "$tmp_file"
 
 # Function to increment the serial number in a zone file
 increment_serial() {
@@ -76,33 +80,50 @@ increment_serial() {
 file"
 }
 
-# Function to determine the reverse zone for an IP address
-determine_reverse_zone() {
+# Function to check and possibly create a forward zone entry
+check_and_create_forward_entry() {
     local ip="$1"
-    IFS='.' read -r -a ip_parts <<< "$ip"
+    local hostname="$2"
+    local forward_db_file="$3"
 
-    for reverse_zone in "${!ZONES[@]}"; do
-        reverse_prefix="${ip_parts[2]}.${ip_parts[1]}.${ip_parts[0]}"
-        if [[ $reverse_zone == *"${reverse_prefix}.in-addr.arpa" ]]; then
-            echo "$reverse_zone"
-            return
+    # Check if the hostname exists in the forward zone file
+    if ! grep -q "$hostname IN A" "$forward_db_file"; then
+        echo "No A record found for $hostname. Do you want to create it? (yes/no)"
+        read create_a
+        if [[ $create_a == "yes" ]]; then
+            echo "$hostname IN A $ip" >> "$forward_db_file"
+            increment_serial "$forward_db_file"
+            echo "A record added: $hostname IN A $ip"
         fi
-    done
-
-    echo ""
+    else
+        echo "A record for $hostname already exists in the forward zone."
+        echo "Do you want to update it with IP $ip? (yes/no)"
+        read update_a
+        if [[ $update_a == "yes" ]]; then
+            sed -i "/$hostname IN A/c\\$hostname IN A $ip" "$forward_db_file"
+            increment_serial "$forward_db_file"
+            echo "A record updated: $hostname IN A $ip"
+        fi
+    fi
 }
 
 # Function to edit zone file
 edit_zone_file() {
     local record_type="$1"
+
+    # Display the current configuration before adding new records
+    echo "Current configuration of the zone file:"
+    cat "$tmp_file"
+    echo "-----------------------------------"
+
     case $record_type in
         A)
             echo "Enter the name of the A record:"
             read name
             echo "Enter the IP address for the A record:"
             read ip
-            echo "$name IN A $ip" >> "$db_file"
-            increment_serial "$db_file"
+            echo "$name IN A $ip" >> "$tmp_file"
+            increment_serial "$tmp_file"
 
             echo "Do you want to create a PTR record for $ip? (yes/no)"
             read create_ptr
@@ -111,10 +132,12 @@ edit_zone_file() {
                 if [[ -n $reverse_zone ]]; then
                     reverse_db_file="${ZONES[$reverse_zone]}"
                     if [[ -f $reverse_db_file ]]; then
+                        reverse_tmp_file=$(mktemp)
+                        cp "$reverse_db_file" "$reverse_tmp_file"
                         IFS='.' read -r -a ip_parts <<< "$ip"
                         octet="${ip_parts[3]}"
-                        echo "$octet IN PTR $name.$zone." >> "$reverse_db_file"
-                        increment_serial "$reverse_db_file"
+                        echo "$octet IN PTR $name.$zone." >> "$reverse_tmp_file"
+                        increment_serial "$reverse_tmp_file"
                         echo "PTR record added to reverse zone $reverse_zone"
                     else
                         echo "Error: Reverse zone database file $reverse_db_file not found."
@@ -129,24 +152,49 @@ edit_zone_file() {
             read cname
             echo "Enter the canonical name for the CNAME record:"
             read cname_target
-            echo "$cname IN CNAME $cname_target" >> "$db_file"
-            increment_serial "$db_file"
+            echo "$cname IN CNAME $cname_target" >> "$tmp_file"
+            increment_serial "$tmp_file"
             ;;
         SRV)
             echo "Enter the service name for the SRV record:"
             read service
             echo "Enter the priority, weight, port, and target for the SRV record (space-separated):"
             read priority weight port target
-            echo "$service IN SRV $priority $weight $port $target" >> "$db_file"
-            increment_serial "$db_file"
+            echo "$service IN SRV $priority $weight $port $target" >> "$tmp_file"
+            increment_serial "$tmp_file"
             ;;
         PTR)
             echo "Enter the last octet of the IP address for the PTR record:"
             read octet
-            echo "Enter the canonical name for the PTR record:"
-            read ptr_target
-            echo "$octet IN PTR $ptr_target" >> "$db_file"
-            increment_serial "$db_file"
+            echo "Enter the host name for the PTR record:"
+            read hostname
+
+            # List available forward zones for selection
+            echo "Select the domain to complete the PTR record:"
+            select domain in "${forward_zones[@]}"; do
+                if [[ -n $domain ]]; then
+                    # Append the selected domain to form the full canonical name
+                    canonical_name="$hostname.$domain."
+                    echo "$octet IN PTR $canonical_name" >> "$tmp_file"
+                    increment_serial "$tmp_file"
+                    echo "PTR record added: $octet IN PTR $canonical_name"
+
+                    # Rebuild the full IP address from the reverse zone
+                    IFS='.' read -r -a zone_parts <<< "${zone//.in-addr.arpa/}"
+                    full_ip="${zone_parts[2]}.${zone_parts[1]}.${zone_parts[0]}.$octet"
+
+                    # Check if the A record exists in the forward zone
+                    forward_db_file="${ZONES[$domain]}"
+                    if [[ -f $forward_db_file ]]; then
+                        check_and_create_forward_entry "$full_ip" "$hostname" "$forward_db_file"
+                    else
+                        echo "Error: Forward zone database file $forward_db_file not found."
+                    fi
+                    break
+                else
+                    echo "Invalid selection. Please try again."
+                fi
+            done
             ;;
         *)
             echo "Unsupported record type."
@@ -169,7 +217,11 @@ fi
 select opt in "${options[@]}"; do
     if [[ $opt == "Exit" ]]; then
         echo "Exiting script."
-        # Thaw all zones before exiting
+        # Clean up temporary files and thaw all zones before exiting
+        rm -f "$tmp_file"
+        if [[ -n $reverse_tmp_file ]]; then
+            rm -f "$reverse_tmp_file"
+        fi
         echo "Thawing all zones:"
         for z in "${!ZONES[@]}"; do
             echo "Thawing zone: $z"
@@ -187,10 +239,26 @@ done
 
 # Output the modified file and ask for confirmation
 echo "Modified zone file:"
-cat "$db_file"
+cat "$tmp_file"
 
 echo "Do you accept these changes? (yes/no)"
 read confirmation
+
+if [[ $confirmation == "yes" ]]; then
+    # Apply changes by moving the temporary file to the original file
+    mv "$tmp_file" "$db_file"
+    if [[ -n $reverse_tmp_file ]]; then
+        mv "$reverse_tmp_file" "$reverse_db_file"
+    fi
+    echo "Zone $zone updated successfully."
+else
+    echo "Changes discarded."
+    # Remove temporary files
+    rm -f "$tmp_file"
+    if [[ -n $reverse_tmp_file ]]; then
+        rm -f "$reverse_tmp_file"
+    fi
+fi
 
 # Thaw all zones
 echo "Thawing all zones:"
@@ -198,9 +266,3 @@ for z in "${!ZONES[@]}"; do
     echo "Thawing zone: $z"
     rndc thaw "$z"
 done
-
-if [[ $confirmation == "yes" ]]; then
-    echo "Zone $zone updated successfully."
-else
-    echo "Changes discarded."
-fi
