@@ -1,3 +1,6 @@
+WE NEED TO UPDATE THIS FOR MULTIPLE INSTANCES OF OPENVPN SERVICE
+###############################################################
+###############################################################
 #!/usr/bin/env bash
 set -euo pipefail
 
