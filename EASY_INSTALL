@@ -7,7 +7,9 @@ GREEN=$(tput setaf 2)
 USER=$(whoami)
 MAJOROS=$(cat /etc/redhat-release | grep -Eo "[0-9]" | sed '$d')
 clear
-echo -e "[${GREEN}SUCCESS${TEXTRESET}] Rocky FirewallBuilder Bootstrap"
+echo -e "[${GREEN}SUCCESS${TEXTRESET}] Rocky FirewallBuilder Admin"
+
+echo -e "${CYAN}==>Checking User...${TEXTRESET}"
 # Checking for user permissions
 if [ "$USER" = "root" ]; then
   echo -e "[${GREEN}SUCCESS${TEXTRESET}] Running as root user."
@@ -18,6 +20,7 @@ else
   exit 1
 fi
 
+echo -e "${CYAN}==>Checking Version...${TEXTRESET}"
 # Extract the major OS version from /etc/redhat-release
 if [ -f /etc/redhat-release ]; then
   MAJOROS=$(grep -oP '\d+' /etc/redhat-release | head -1)
@@ -38,13 +41,18 @@ else
   exit 1
 fi
 
-cat <<EOF
+echo -e "${CYAN}==>Retrieving files from Github...${TEXTRESET}"
 
-${GREEN}**************************${TEXTRESET}
-Please wait while we gather some files
-${GREEN}**************************${TEXTRESET}
+sleep 1
+#Clone RFWB-admin
+mkdir -p /root/.rfwb-admin
 
-EOF
+rm -rf /root/RFWB && git clone https://github.com/fumatchu/RFWB-SM.git /root/.rrwb-admin
+
+chmod 700 /root/.rfwb-admin/*
+
+echo -e "[${YELLOW}INFO${TEXTRESET}] Removing Git"
+dnf -y remove git >/dev/null 2>&1
 
 echo -e "[${YELLOW}INFO${TEXTRESET}] Installing wget and git..."
 
@@ -89,32 +97,6 @@ chmod 700 /root/RFWB/*
 echo -e "[${YELLOW}INFO${TEXTRESET}] Removing Git"
 dnf -y remove git >/dev/null 2>&1
 
-clear
-cat <<EOF
- *********************************************
-
- This script was created for ${GREEN}Rocky 9.x${TEXTRESET}
- This will install 
- 1. The Rocky Firewall Builder based on nftables
- 
- What this script does:
- 1. Validates and upgrades the system
- 2. Sets internal Interfaces with zones and (vlans)
- 3. Configures and locks down external interface with user preferences
- 4. Provides a set of applications that can be installed:
-     -Bind
-     -ISC-KEA
-     -Webmin
-     -Cockpit
-     -DDNS Client 
-     -Suricata (Standalone)
-     -Suricata with Elastic/Kibana/Filebeat for events and alerts
-     -ntop-ng
-
- *********************************************
- 
-
-EOF
 
 read -p "Press Any Key to Continue"
 /root/RFWB/test.sh
