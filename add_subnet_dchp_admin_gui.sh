@@ -98,6 +98,15 @@ More examples: bootfile-name, time-servers, log-servers, domain-name"
     msg_box "Examples" "DHCP Option Examples" "$examples"
 }
 
+# Function to display an info box
+info_box() {
+    local backtitle="${1-}"
+    local title="${2-}"
+    local message="${3-}"
+
+    dialog --clear --backtitle "$backtitle" --title "$title" --infobox "$message" 10 50
+}
+
 while true; do
   USED_INTERFACES=$(jq -r '.Dhcp4.subnet4[].interface' "$INPUT_CONFIG")
   BASE_IFACE=$(nmcli -t -f DEVICE,CONNECTION device status | awk -F: '$2 ~ /-inside$/ {print $1}')
@@ -190,9 +199,9 @@ while true; do
   EXTRA_JSON=$(IFS=,; echo "${EXTRA_OPTIONS[*]}")
 
   dialog --clear --backtitle "Review Settings" --title "Configuration Review" --msgbox \
-    "Friendly Name: $description\nNetwork Scheme: $CIDR\nInterface: $SELECTED_IFACE\nIP Pool Range: $pool_start - $pool_end\nRouter Address: $router_address\
-nNTP Server: $dns_server_ip\nDNS Server: $dns_server_ip\nClient suffix: $domain\nClient Search Domain: $domain\n\nCustom DHCP Options:\n$(IFS=$'\n'; echo "${
-EXTRA_OPTIONS[*]}" | jq -r '. | "- " + (if .code then "[code=" + (.code|tostring) + "] " else "" end) + .name + " = " + .data')" 15 40
+    "Friendly Name: $description\nNetwork Scheme: $CIDR\nInterface: $SELECTED_IFACE\nIP Pool Range: $pool_start - $pool_end\nRouter Address: $router_address
+\nNTP Server: $dns_server_ip\nDNS Server: $dns_server_ip\nClient suffix: $domain\nClient Search Domain: $domain\n\nCustom DHCP Options:\n$(IFS=$'\n'; echo "
+${EXTRA_OPTIONS[*]}" | jq -r '. | "- " + (if .code then "[code=" + (.code|tostring) + "] " else "" end) + .name + " = " + .data')" 20 70
 
   if yesno_box "Confirmation" "Review" "Is this configuration correct?"; then
       pool_range="$pool_start - $pool_end"
@@ -225,14 +234,15 @@ EXTRA_OPTIONS[*]}" | jq -r '. | "- " + (if .code then "[code=" + (.code|tostring
       jq --argjson new_subnet "$NEW_SUBNET" '.Dhcp4.subnet4 += [$new_subnet]' "$INPUT_CONFIG" > "$TMP_CONFIG"
 
       if jq . "$TMP_CONFIG" > "$INPUT_CONFIG"; then
-          msg_box "Success" "Subnet added successfully." "Subnet added successfully.\nRestarting KEA DHCP service..."
+          info_box "Success" "Operation Status" "Subnet added successfully.\nRestarting KEA DHCP service..."
+          sleep 2
           if systemctl restart kea-dhcp4; then
-              msg_box "Success" "KEA DHCP restarted." "KEA DHCP restarted."
+              msg_box "Success" "KEA DHCP Restarted" "KEA DHCP restarted."
           else
-              msg_box "Error" "Failed to restart KEA DHCP." "Failed to restart KEA DHCP."
+              msg_box "Error" "Failed Operation" "Failed to restart KEA DHCP."
           fi
       else
-          msg_box "Failure" "Failed to validate updated config." "Failed to validate updated config. Reverting."
+          msg_box "Failure" "Operation Failed" "Failed to validate updated config. Reverting."
           exit 1
       fi
 
@@ -244,11 +254,11 @@ EXTRA_OPTIONS[*]}" | jq -r '. | "- " + (if .code then "[code=" + (.code|tostring
       hostname="${full_hostname%%.*}"
       domain="${full_hostname#*.}"
 
-      msg_box "Info" "Checking for reverse zone: ${reverse_zone}" "Checking for reverse zone: ${reverse_zone}"
+      info_box "Info" "Zone Check" "Checking for reverse zone: ${reverse_zone}"
+      sleep 2
 
       if ! grep -q "zone \"$reverse_zone\"" "$NAMED_CONF"; then
-          msg_box "Info" "Reverse zone not found. Creating..." "Reverse zone not found. Creating..."
-
+          msg_box "Info" "Reverse Zone Creation" "Reverse zone ${reverse_zone} not found. Creating..."
           cat >> "$NAMED_CONF" <<EOF
 
 zone "$reverse_zone" {
@@ -273,19 +283,22 @@ EOF
 
           chmod 640 "$reverse_zone_file"
           chown named:named "$reverse_zone_file"
+
+          info_box "Success" "Reverse Zone Added" "Reverse zone ${reverse_zone} added to DNS."
+          sleep 2
       else
-          msg_box "Success" "Reverse zone already exists." "Reverse zone already exists."
+          msg_box "Success" "Reverse Zone Status" "Reverse zone ${reverse_zone} already exists."
       fi
 
       if systemctl restart named; then
-          msg_box "Success" "Named restarted." "Named restarted."
+          msg_box "Success" "Named Restarted" "Named restarted."
       else
-          msg_box "Error" "Failed to restart named." "Failed to restart named."
+          msg_box "Error" "Failed Operation" "Failed to restart named."
       fi
 
       break
   else
-      msg_box "Info" "Let's try that again..." "Let's try that again..."
+      msg_box "Info" "Retry Configuration" "Let's try that again..."
   fi
 
 done
