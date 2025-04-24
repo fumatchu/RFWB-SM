@@ -161,6 +161,28 @@ view_qos_stats() {
   rm -f "$tmp_stats"
 }
 
+# ===== Clear TC Stats =====
+clear_tc_stats() {
+  LOG_FILE="/var/log/tc-clear.log"
+  ERROR_LOG_FILE="/var/log/tc-clear-errors.log"
+  TMP_OUT=$(mktemp)
+
+  echo "==== $(date) Starting TC clearing process ====" >> "$LOG_FILE"
+
+  for iface in $(ls /sys/class/net); do
+    echo "Clearing tc settings on: $iface" >> "$LOG_FILE"
+    if sudo tc qdisc del dev "$iface" root 2>>"$ERROR_LOG_FILE"; then
+      echo "✓ Cleared: $iface" >> "$TMP_OUT"
+    else
+      echo "✗ No tc settings or error on: $iface" >> "$TMP_OUT"
+    fi
+  done
+
+  echo "==== TC clearing complete ====" >> "$LOG_FILE"
+  dialog --title "Clear QoS (tc) Stats" --textbox "$TMP_OUT" 20 80
+  rm -f "$TMP_OUT"
+}
+
 # ===== Service Control =====
 service_control() {
   while true; do
@@ -207,12 +229,13 @@ service_control() {
 # ===== Main Menu =====
 main_menu() {
   while true; do
-    choice=$(dialog --clear --title "QoS Admin Menu" --menu "Choose an option:" 18 60 8 \
+    choice=$(dialog --clear --title "QoS Admin Menu" --menu "Choose an option:" 20 60 10 \
       1 "Edit QoS Settings (Menu)" \
       2 "Edit Config File (Dialog-Based)" \
       3 "QoS Service Control" \
       4 "Exit" \
       5 "View QoS Stats" \
+      6 "Clear QoS (tc) Stats" \
       3>&1 1>&2 2>&3)
 
     case "$choice" in
@@ -221,6 +244,7 @@ main_menu() {
       3) service_control ;;
       4) clear; exit 0 ;;
       5) view_qos_stats ;;
+      6) clear_tc_stats ;;
     esac
   done
 }
