@@ -6,7 +6,8 @@ declare -A MODULE_PATHS=(
   [DHCP]="/etc/kea/kea-dhcp4.conf"
   [DNS]="/etc/named.conf"
   [Suricata]="/etc/suricata/suricata.yaml"
-  [YQ]="/usr/bin/yq"
+  [RFWB-PORTSCAN]="/etc/rfwb-portscan.conf"
+  [NFT-Threatlist]="/usr/local/bin/update_nft_threatlist.sh"
 )
 
 declare -A MODULE_SCRIPTS=(
@@ -14,7 +15,8 @@ declare -A MODULE_SCRIPTS=(
   [DHCP]="/root/.rfwb-admin/dhcp-admin.sh"
   [DNS]="/root/.rfwb-admin/dns-admin.sh"
   [Suricata]="/root/.rfwb-admin/suricata-admin.sh"
-  [YQ]="/root/.rfwb-admin/yq-admin.sh"
+  [RFWB-PORTSCAN]="/root/.rfwb-admin/rfwb-portscan-admin.sh"
+  [NFT-Threatlist]="/root/.rfwb-admin/nft-threat-admin.sh"
 )
 
 declare -A MODULE_DESCRIPTIONS=(
@@ -22,7 +24,8 @@ declare -A MODULE_DESCRIPTIONS=(
   [DHCP]="Configure Kea DHCP server"
   [DNS]="Manage BIND DNS zones"
   [Suricata]="Inspect Suricata IDS config"
-  [YQ]="Use yq for YAML processing"
+  [RFWB-PORTSCAN]="Portscan detection for nftables"
+  [NFT-Threatlist]="Threatlist updates for nftables"
 )
 
 #========[ MODULE HANDLER ]========#
