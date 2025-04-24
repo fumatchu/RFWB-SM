@@ -57,10 +57,12 @@ manual_remove_ip() {
 
 # ===== View Logs =====
 view_logs() {
-  if [[ -f "$LOG_FILE" ]]; then
-    dialog --title "rfwb-portscan Logs" --textbox "$LOG_FILE" 25 100
+  if grep -q "Port Scan Detected" /var/log/messages; then
+    grep "Port Scan Detected" /var/log/messages | tail -n 500 > /tmp/scanlog
+    dialog --title "Port Scan Detections" --textbox /tmp/scanlog 25 100
+    rm -f /tmp/scanlog
   else
-    msg_box "Logs Missing" "$LOG_FILE not found."
+    msg_box "No Logs" "No 'Port Scan Detected' entries found in /var/log/messages."
   fi
 }
 
