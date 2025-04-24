@@ -13,9 +13,23 @@ msg_box() { dialog --title "$1" --msgbox "$2" 8 60; }
 edit_file() {
   tmp=$(mktemp)
   cp "$1" "$tmp"
-  dialog --title "Editing $(basename "$1")" --editbox "$tmp" 25 80 2>"$1"
-  rm -f "$tmp"
-  msg_box "Updated" "Saved changes to $(basename "$1")"
+  out=$(mktemp)
+
+  dialog --title "Editing $(basename "$1")" --editbox "$tmp" 25 80 2>"$out"
+  rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    if ! cmp -s "$tmp" "$out"; then
+      cp "$out" "$1"
+      msg_box "Updated" "Saved changes to $(basename "$1")"
+    else
+      msg_box "No Changes" "No changes were made to $(basename "$1")"
+    fi
+  else
+    msg_box "Cancelled" "Edit cancelled. No changes were made."
+  fi
+
+  rm -f "$tmp" "$out"
 }
 
 # ===== View Blocked IPs =====
@@ -79,24 +93,6 @@ service_control() {
   done
 }
 
-# ===== Live Scan Monitor =====
-live_scan_view() {
-  ip=$(dialog --inputbox "Enter IP to watch (blank for all):" 8 50 2>&1 >/dev/tty)
-  tmp_log=$(mktemp)
-
-  if [[ -n "$ip" ]]; then
-    tail -n 100 -f /var/log/messages | grep --line-buffered "Port Scan Detected" | grep --line-buffered "$ip" > "$tmp_log" &
-  else
-    tail -n 100 -f /var/log/messages | grep --line-buffered "Port Scan Detected" > "$tmp_log" &
-  fi
-
-  TAIL_PID=$!
-  dialog --title "Live Port Scan Monitor${ip:+ (IP: $ip)}" --tailbox "$tmp_log" 25 100
-  kill $TAIL_PID
-  rm -f "$tmp_log"
-}
-  rm -f "$tmp_log"
-}
 
 # ===== Main Menu =====
 main_menu() {
@@ -110,8 +106,7 @@ main_menu() {
       6 "Edit Ignore Ports" \
       7 "View Logs" \
       8 "Service Control" \
-      9 "Live Scan Monitor" \
-      10 "Exit" \
+      9 "Exit" \
       3>&1 1>&2 2>&3)
 
     case $choice in
@@ -123,8 +118,7 @@ main_menu() {
       6) edit_file "$IGNORE_PORTS_FILE" ;;
       7) view_logs ;;
       8) service_control ;;
-      10|*) clear; exit 0 ;;
-      9) live_scan_view ;;
+      9 |*) clear; exit 0 ;;
     esac
   done
 }
