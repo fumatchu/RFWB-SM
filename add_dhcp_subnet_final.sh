@@ -313,9 +313,10 @@ fi
     fi
 
   else
-    dialog --msgbox "Validation failed. Check /tmp/debug-kea-dhcp4.conf." 6 50
     cp "$CONFIG_FILE" /tmp/debug-kea-dhcp4.conf
-    exit 1
+    dialog --msgbox "Validation failed. Configuration saved to /tmp/debug-kea-dhcp4.conf for troubleshooting.
+Returning to main menu." 8 60
+    return
   fi
   }
   add_subnet_dialog
