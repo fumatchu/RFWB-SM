@@ -1,8 +1,8 @@
 #!/bin/bash
 
 THREAT_SCRIPT="/usr/local/bin/update_nft_threatlist.sh"
-BLOCK_SET_NAME="threatlist"
-NFTABLES_TABLE="inet"
+BLOCK_SET_NAME="threat_block"
+NFTABLES_TABLE="inet filter"
 NFTABLES_CHAIN="input"
 THREAT_FEEDS_FILE="/etc/nft-threatlist-feeds.txt"
 LOGFILE="/var/log/nft-threatlist.log"
@@ -22,7 +22,9 @@ input_box() {
 # ===== View Current IPs =====
 view_threatlist() {
   tmp=$(mktemp)
-  nft list set $NFTABLES_TABLE $BLOCK_SET_NAME > "$tmp" 2>/dev/null || echo "Set not found." > "$tmp"
+  nft list set inet filter $BLOCK_SET_NAME 2>/dev/null | \
+    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+    sort -u > "$tmp"
   dialog --title "Current Blocked IPs" --textbox "$tmp" 25 80
   rm -f "$tmp"
 }
@@ -33,9 +35,13 @@ add_ip() {
   input_box "Add IP" "Enter IP to block:" "" || return
   ip="$INPUT"
   if [[ -n "$ip" ]]; then
-    nft add element $NFTABLES_TABLE $BLOCK_SET_NAME { $ip } 2>/dev/null && \
-      echo "[$(date)] Added $ip manually" >> "$LOGFILE" && \
-      msg_box "Success" "$ip added to blocklist."
+    if grep -q "^$ip$" /etc/nft-threat-list/manual_block_list.txt; then
+      msg_box "Already Exists" "$ip is already in the manual block list."
+    else
+      echo "$ip" >> /etc/nft-threat-list/manual_block_list.txt
+      echo "[$(date)] Queued $ip for manual block" >> "$LOGFILE"
+      msg_box "Success" "$ip added to manual block list."
+    fi
   fi
   rm -f "$TEMP_INPUT"
 }
@@ -46,9 +52,14 @@ remove_ip() {
   input_box "Remove IP" "Enter IP to remove from blocklist:" "" || return
   ip="$INPUT"
   if [[ -n "$ip" ]]; then
-    nft delete element $NFTABLES_TABLE $BLOCK_SET_NAME { $ip } 2>/dev/null && \
-      echo "[$(date)] Removed $ip manually" >> "$LOGFILE" && \
-      msg_box "Success" "$ip removed from blocklist."
+    if grep -q "^$ip$" /etc/nft-threat-list/manual_block_list.txt; then
+      grep -v "^$ip$" /etc/nft-threat-list/manual_block_list.txt > /tmp/filtered_blocklist && \
+      mv /tmp/filtered_blocklist /etc/nft-threat-list/manual_block_list.txt
+      echo "[$(date)] Removed $ip from manual block list" >> "$LOGFILE"
+      msg_box "Removed" "$ip removed from manual block list."
+    else
+      msg_box "Not Found" "$ip was not found in the manual block list."
+    fi
   fi
   rm -f "$TEMP_INPUT"
 }
@@ -57,9 +68,19 @@ remove_ip() {
 edit_feeds() {
   tmp=$(mktemp)
   cp "$THREAT_FEEDS_FILE" "$tmp"
-  dialog --editbox "$tmp" 20 70 2>"$THREAT_FEEDS_FILE"
-  rm -f "$tmp"
-  msg_box "Updated" "Feed list saved to $THREAT_FEEDS_FILE"
+  out=$(mktemp)
+
+  dialog --editbox "$tmp" 20 70 2>"$out"
+  rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    cp "$out" "$THREAT_FEEDS_FILE"
+    msg_box "Updated" "Feed list saved to $THREAT_FEEDS_FILE"
+  else
+    msg_box "Cancelled" "Feed edit cancelled. No changes made."
+  fi
+
+  rm -f "$tmp" "$out"
 }
 
 # ===== Run Update Script =====
@@ -67,6 +88,53 @@ run_update() {
   bash "$THREAT_SCRIPT" > /tmp/threatlist-update.log 2>&1
   dialog --textbox /tmp/threatlist-update.log 25 80
   rm -f /tmp/threatlist-update.log
+}
+
+# ===== Show Pending Manual IPs =====
+show_pending_manual() {
+  TMP_FILE=$(mktemp)
+  awk '/#########/{found=1; next} found && /^[0-9]+\./' /etc/nft-threat-list/manual_block_list.txt | sort -u > "$TMP_FILE"
+  # Remove IPs already present in nftables
+  nft list set inet filter $BLOCK_SET_NAME 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u > /tmp/current_nft_ips
+  grep -vxFf /tmp/current_nft_ips "$TMP_FILE" > /tmp/pending_cleaned && mv /tmp/pending_cleaned "$TMP_FILE"
+  if [[ -s "$TMP_FILE" ]]; then
+    dialog --title "Pending Manual IPs" --textbox "$TMP_FILE" 25 80
+  else
+    msg_box "No Pending IPs" "No manually queued IPs remaining (all are applied)."
+  fi
+  rm -f "$TMP_FILE" /tmp/current_nft_ips
+}
+
+# ===== Apply Local Changes Only =====
+apply_manual_blocklist() {
+  dialog --title "Applying Manual Blocklist" --infobox "Applying updates to nftables..." 5 50
+  sleep 1
+  THREAT_LIST_FILE="/etc/nft-threat-list/threat_list.txt"
+  MANUAL_BLOCK_LIST="/etc/nft-threat-list/manual_block_list.txt"
+  COMBINED_BLOCK_LIST="/etc/nft-threat-list/combined_block_list.txt"
+  TMP_FILE="/etc/nft-threat-list/threat_list.tmp"
+
+  # Combine both static feed list and manual list
+  awk '/#########/{found=1; next} found && /^[0-9]+\./' "$MANUAL_BLOCK_LIST" > "$TMP_FILE"
+  cat "$THREAT_LIST_FILE" "$TMP_FILE" | sort -u > "$COMBINED_BLOCK_LIST"
+
+  # Ensure the nftables set exists
+  if ! nft list set inet filter threat_block &>/dev/null; then
+    nft add table inet filter 2>/dev/null
+    nft add set inet filter threat_block { type ipv4_addr\; flags timeout\; }
+  else
+    nft flush set inet filter threat_block
+  fi
+
+  # Add all IPs from the combined list to nftables
+  while IFS= read -r ip; do
+    [[ -n "$ip" ]] && nft add element inet filter threat_block { $ip }
+  done < "$COMBINED_BLOCK_LIST"
+
+  IP_COUNT=$(wc -l < "$COMBINED_BLOCK_LIST")
+  echo "[$(date)] Manual update applied with $IP_COUNT IPs from combined list." >> "$LOGFILE"
+  clear
+  msg_box "Manual Update Complete" "$IP_COUNT IPs applied from local combined list."
 }
 
 # ===== Cron Toggle =====
@@ -144,31 +212,35 @@ main_menu() {
     [[ -z "$LAST_RUN" ]] && LAST_RUN="Not found"
   fi
     if nft list set $NFTABLES_TABLE $BLOCK_SET_NAME &>/dev/null; then
-    BLOCKED_IPS=$(nft list set $NFTABLES_TABLE $BLOCK_SET_NAME | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+    BLOCKED_IPS=$(nft list set inet filter $BLOCK_SET_NAME | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
   fi
   while true; do
-    choice=$(dialog --clear --title "NFT Threat List Admin [Last run: $LAST_RUN | IPs: $BLOCKED_IPS]" --menu "Select an option:" 20 60 10 \
-      1 "View Current Blocked IPs" \
-      2 "Manually Add IP to Blocklist" \
-      3 "Manually Remove IP" \
-      4 "Edit Feed URLs" \
-      5 "Run Threatlist Update Now" \
-      6 "Enable/Disable Daily Auto-Update" \
-      7 "Service Control" \
-      8 "Exit" \
-      3>&1 1>&2 2>&3)
+    choice=$(dialog --clear --title "NFT Threat List Admin" --menu "Select an option:" 20 60 10 \
+  1 "View Current Blocked IPs" \
+  2 "Manually Add IP to Blocklist" \
+  3 "Manually Remove IP" \
+  4 "Edit Feed URLs" \
+  5 "Apply Manual IP Blocklist Now" \
+  6 "Show Pending Manual IPs" \
+  7 "Run Full Threatlist Update" \
+  8 "Enable/Disable Daily Auto-Update" \
+  9 "Service Control" \
+  10 "Exit" \
+  3>&1 1>&2 2>&3)
 
-    case "$choice" in
-      1) view_threatlist ;;
-      2) add_ip ;;
-      3) remove_ip ;;
-      4) edit_feeds ;;
-      5) run_update ;;
-      6) toggle_cron ;;
-      9|*) clear; exit 0 ;;
-      7) service_control ;;
-      8) clear; exit 0 ;;
-    esac
+  case "$choice" in
+  1) view_threatlist ;;
+  2) add_ip ;;
+  3) remove_ip ;;
+  4) edit_feeds ;;
+  5) apply_manual_blocklist ;;
+  6) show_pending_manual ;;
+  7) run_update ;;
+  8) toggle_cron ;;
+  9) service_control ;;
+  10|*) clear; exit 0 ;;
+esac
+
   done
 }
 
