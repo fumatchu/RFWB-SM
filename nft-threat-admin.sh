@@ -1,5 +1,5 @@
 #!/bin/bash
-
+########COMPLETE################
 THREAT_SCRIPT="/usr/local/bin/update_nft_threatlist.sh"
 BLOCK_SET_NAME="threat_block"
 NFTABLES_TABLE="inet filter"
