@@ -29,6 +29,34 @@ view_threatlist() {
   rm -f "$tmp"
 }
 
+# ===== Search for IP =====
+search_threatlist() {
+  TEMP_INPUT=$(mktemp)
+  ip_list=$(mktemp)
+  match_result=$(mktemp)
+
+  # Extract all current blocked IPs
+  nft list set inet filter $BLOCK_SET_NAME 2>/dev/null | \
+    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u > "$ip_list"
+
+  dialog --inputbox "Enter full or partial IP to search (e.g. 192.168. or 10.0.0.5):" 10 60 2>"$TEMP_INPUT"
+  result=$?
+  [[ $result -ne 0 ]] && { rm -f "$TEMP_INPUT" "$ip_list" "$match_result"; return; }
+
+  query=$(<"$TEMP_INPUT")
+  grep -F "$query" "$ip_list" > "$match_result"
+
+  if [[ -s "$match_result" ]]; then
+    dialog --title "Matches for '$query'" --textbox "$match_result" 20 60
+  else
+    msg_box "No Matches" "No IPs matching '$query' were found in the current threat list."
+  fi
+
+  rm -f "$TEMP_INPUT" "$ip_list" "$match_result"
+}
+
+
+
 # ===== Manually Add IP =====
 add_ip() {
   TEMP_INPUT=$(mktemp)
@@ -40,7 +68,9 @@ add_ip() {
     else
       echo "$ip" >> /etc/nft-threat-list/manual_block_list.txt
       echo "[$(date)] Queued $ip for manual block" >> "$LOGFILE"
-      msg_box "Success" "$ip added to manual block list."
+      nft add element inet filter threat_block { $ip } 2>/dev/null
+      msg_box "Success" "$ip added to manual block list and applied to nftables."
+
     fi
   fi
   rm -f "$TEMP_INPUT"
@@ -55,32 +85,76 @@ remove_ip() {
     if grep -q "^$ip$" /etc/nft-threat-list/manual_block_list.txt; then
       grep -v "^$ip$" /etc/nft-threat-list/manual_block_list.txt > /tmp/filtered_blocklist && \
       mv /tmp/filtered_blocklist /etc/nft-threat-list/manual_block_list.txt
+      nft delete element inet filter threat_block { $ip } 2>/dev/null
       echo "[$(date)] Removed $ip from manual block list" >> "$LOGFILE"
-      msg_box "Removed" "$ip removed from manual block list."
+      msg_box "Removed" "$ip removed from manual block list and nftables."
+
     else
       msg_box "Not Found" "$ip was not found in the manual block list."
     fi
   fi
   rm -f "$TEMP_INPUT"
 }
-
-# ===== Edit Feed URLs =====
+# ===== EDIT FEEDS =====
 edit_feeds() {
-  tmp=$(mktemp)
-  cp "$THREAT_FEEDS_FILE" "$tmp"
-  out=$(mktemp)
+  local updater_script="/usr/local/bin/update_nft_threatlist.sh"
+  local backup="${updater_script}.bak.$(date +%Y%m%d%H%M%S)"
+  local tmp_clean=$(mktemp)
+  local tmp_edit=$(mktemp)
+  local tmp_final=$(mktemp)
+  local tmp_new=$(mktemp)
 
-  dialog --editbox "$tmp" 20 70 2>"$out"
-  rc=$?
+  awk '/^THREAT_LISTS=\(/,/^\)/ {
+  if ($0 ~ /^THREAT_LISTS=\(/ || $0 ~ /^\)/) next
+  gsub(/"/, "", $0)
+  sub(/^[[:space:]]+/, "", $0)
+  sub(/[[:space:]]+$/, "", $0)
+  print $0
+  }' "$updater_script" > "$tmp_clean"
+
+
+  dialog --editbox "$tmp_clean" 20 70 2>"$tmp_edit"
+  local rc=$?
 
   if [[ $rc -eq 0 ]]; then
-    cp "$out" "$THREAT_FEEDS_FILE"
-    msg_box "Updated" "Feed list saved to $THREAT_FEEDS_FILE"
+    cp "$updater_script" "$backup"
+
+    if [[ ! -s "$tmp_edit" ]]; then
+      msg_box "Empty Feed List" "Feed list cannot be empty.\nRestoring default feeds."
+      cat > "$tmp_edit" <<EOF
+https://iplists.firehol.org/files/firehol_level1.netset
+https://www.abuseipdb.com/blacklist.csv
+https://rules.emergingthreats.net/blockrules/compromised-ips.txt
+EOF
+    fi
+
+    {
+     echo "THREAT_LISTS=("
+     sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$tmp_edit" | sed 's/^/  "/;s/$/"/'
+     echo ")"
+    } > "$tmp_final"
+
+    awk -v new_block="$tmp_final" '
+      BEGIN {
+        while ((getline line < new_block) > 0) {
+          block[++i] = line
+        }
+        close(new_block)
+      }
+      /^THREAT_LISTS=\(/ { in_block = 1; for (j = 1; j <= i; j++) print block[j]; next }
+      in_block && /^\)/ { in_block = 0; next }
+      !in_block { print }
+    ' "$updater_script" > "$tmp_new"
+
+    mv "$tmp_new" "$updater_script"
+    chmod +x "$updater_script"
+
+    msg_box "Feeds Updated" "Feed list updated successfully.\nBackup saved: $backup"
   else
     msg_box "Cancelled" "Feed edit cancelled. No changes made."
   fi
 
-  rm -f "$tmp" "$out"
+  rm -f "$tmp_clean" "$tmp_edit" "$tmp_final" "$tmp_new"
 }
 
 # ===== Run Update Script =====
@@ -105,36 +179,13 @@ show_pending_manual() {
   rm -f "$TMP_FILE" /tmp/current_nft_ips
 }
 
-# ===== Apply Local Changes Only =====
-apply_manual_blocklist() {
-  dialog --title "Applying Manual Blocklist" --infobox "Applying updates to nftables..." 5 50
-  sleep 1
-  THREAT_LIST_FILE="/etc/nft-threat-list/threat_list.txt"
-  MANUAL_BLOCK_LIST="/etc/nft-threat-list/manual_block_list.txt"
-  COMBINED_BLOCK_LIST="/etc/nft-threat-list/combined_block_list.txt"
-  TMP_FILE="/etc/nft-threat-list/threat_list.tmp"
-
-  # Combine both static feed list and manual list
-  awk '/#########/{found=1; next} found && /^[0-9]+\./' "$MANUAL_BLOCK_LIST" > "$TMP_FILE"
-  cat "$THREAT_LIST_FILE" "$TMP_FILE" | sort -u > "$COMBINED_BLOCK_LIST"
-
-  # Ensure the nftables set exists
-  if ! nft list set inet filter threat_block &>/dev/null; then
-    nft add table inet filter 2>/dev/null
-    nft add set inet filter threat_block { type ipv4_addr\; flags timeout\; }
+# ===== View Logs =====
+view_logs() {
+  if [[ -f "$LOGFILE" ]]; then
+    dialog --title "Threat List Logs" --textbox "$LOGFILE" 25 100
   else
-    nft flush set inet filter threat_block
+    msg_box "No Logs" "Log file not found: $LOGFILE"
   fi
-
-  # Add all IPs from the combined list to nftables
-  while IFS= read -r ip; do
-    [[ -n "$ip" ]] && nft add element inet filter threat_block { $ip }
-  done < "$COMBINED_BLOCK_LIST"
-
-  IP_COUNT=$(wc -l < "$COMBINED_BLOCK_LIST")
-  echo "[$(date)] Manual update applied with $IP_COUNT IPs from combined list." >> "$LOGFILE"
-  clear
-  msg_box "Manual Update Complete" "$IP_COUNT IPs applied from local combined list."
 }
 
 # ===== Cron Toggle =====
@@ -159,45 +210,44 @@ view_logs() {
   fi
 }
 
-# ===== Show Last Run =====
+# ===== Show Last run  =====
 show_last_run() {
-  if [[ -f "$LOGFILE" ]]; then
-    last_run=$(grep 'Completed update' "$LOGFILE" | tail -n 1)
-    [[ -z "$last_run" ]] && last_run="No successful update found."
-  else
-    last_run="Log file not found."
+  local syslog="/var/log/messages"
+  local tmp_log=$(mktemp)
+
+  # Grab the last starting point of an update
+  local start_line
+  start_line=$(grep -n 'nft-threat-list' "$syslog" | grep 'Starting NFTables threat list update' | tail -n 1 | cut -d: -f1)
+
+  if [[ -z "$start_line" ]]; then
+    msg_box "Last Update Status" "No successful update found."
+    return
   fi
-  msg_box "Last Update Status" "$last_run"
+
+  # Grab 20 lines from the start (safe window)
+  sed -n "$start_line,$((start_line + 20))p" "$syslog" > "$tmp_log"
+
+  # Extract data
+  local timestamp ip_count
+  timestamp=$(grep 'Starting NFTables threat list update' "$tmp_log" | awk '{print $1, $2, $3}')
+  ip_count=$(grep 'Threat list update completed' "$tmp_log" | grep -oE '[0-9]+ IPs')
+
+  mapfile -t urls < <(grep 'Downloading' "$tmp_log" | awk -F'Downloading ' '{print $2}')
+
+  # Build summary
+  local summary="Last Update: $timestamp\n$ip_count\n\nDownloaded Feeds:"
+  if [[ ${#urls[@]} -eq 0 ]]; then
+    summary+="\n(no feeds logged)"
+  else
+    for url in "${urls[@]}"; do
+      summary+="\n- $url"
+    done
+  fi
+
+  dialog --title "Last Update Status" --msgbox "$summary" 20 90
+  rm -f "$tmp_log"
 }
 
-# ===== Service Control =====
-service_control() {
-  while true; do
-    choice=$(dialog --clear --title "nft-threatlist Service Control" --menu "Choose an action (Cancel→main menu):" 15 60 6 \
-      1 "Show service status" \
-      2 "View recent logs" \
-      3 "Restart update script" \
-      4 "Show last successful update" \
-      5 "Back to Main Menu" \
-      3>&1 1>&2 2>&3)
-
-    case "$choice" in
-      1)
-        systemctl status nft-threatlist.service | tee /tmp/nft_status
-        dialog --textbox /tmp/nft_status 20 80
-        ;;
-      2)
-        view_logs
-        ;;
-      3)
-        systemctl restart nft-threatlist.service
-        msg_box "Service Restarted" "nft-threatlist service restarted."
-        ;;
-      6|*) break ;;
-      4) show_last_run ;;
-    esac
-  done
-}
 
 # ===== Main Menu =====
 main_menu() {
@@ -217,27 +267,27 @@ main_menu() {
   while true; do
     choice=$(dialog --clear --title "NFT Threat List Admin" --menu "Select an option:" 20 60 10 \
   1 "View Current Blocked IPs" \
-  2 "Manually Add IP to Blocklist" \
-  3 "Manually Remove IP" \
-  4 "Edit Feed URLs" \
-  5 "Apply Manual IP Blocklist Now" \
-  6 "Show Pending Manual IPs" \
-  7 "Run Full Threatlist Update" \
-  8 "Enable/Disable Daily Auto-Update" \
-  9 "Service Control" \
+  2 "Search IP's in Threatlist" \
+  3 "Manually Add IP to Blocklist" \
+  4 "Manually Remove IP" \
+  5 "Edit Feed URLs" \
+  6 "Run Full Threatlist Update" \
+  7 "Enable/Disable Daily Auto-Update" \
+  8 "View Recent Logs" \
+  9 "Show Last update log" \
   10 "Exit" \
   3>&1 1>&2 2>&3)
 
   case "$choice" in
   1) view_threatlist ;;
-  2) add_ip ;;
-  3) remove_ip ;;
-  4) edit_feeds ;;
-  5) apply_manual_blocklist ;;
-  6) show_pending_manual ;;
-  7) run_update ;;
-  8) toggle_cron ;;
-  9) service_control ;;
+  2) search_threatlist ;;
+  3) add_ip ;;
+  4) remove_ip ;;
+  5) edit_feeds ;;
+  6) run_update ;;
+  7) toggle_cron ;;
+  8) view_logs ;;
+  9) show_last_run ;;
   10|*) clear; exit 0 ;;
 esac
 
