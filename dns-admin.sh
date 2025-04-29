@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-#######COMPLETE#########
 set -euo pipefail
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -56,10 +55,26 @@ show_zones() {
   mapfile -t zones < <(list_zones)
   if [ ${#zones[@]} -eq 0 ]; then
     dialog --msgbox "No zones defined." 6 40
-  else
-    msg=$(printf "• %s\n" "${zones[@]}")
-    dialog --title "All Defined Zones" --msgbox "$msg" 20 60
+    return
   fi
+
+  # Build list with forwarding zone labels
+  display_list=()
+  for z in "${zones[@]}"; do
+    if awk -v zone="$z" '
+        $0 ~ "zone \"" zone "\"" { inside=1 }
+        inside && /type[[:space:]]+forward/ { found=1 }
+        inside && /^};/ { exit }
+        END { exit !found }
+    ' "$NAMED_CONF"; then
+      display_list+=( "• $z (forwarding zone)" )
+    else
+      display_list+=( "• $z" )
+    fi
+  done
+
+  msg=$(printf "%s\n" "${display_list[@]}")
+  dialog --title "All Defined Zones" --msgbox "$msg" 20 60
 }
 
 finalize_file() {
@@ -85,6 +100,156 @@ increment_soa_serial() {
 
 
 # ─── Zone‑Management Handlers ─────────────────────────────────────────────────
+
+# ─── Add Forwarding Zone ──────────────────────────────────────────────────────
+edit_forwarding_zones() {
+  mkdir -p "$STAGING_DIR"
+  cp "$NAMED_CONF" "$STAGING_DIR/named.conf"
+
+  mapfile -t forward_zones < <(awk '
+    BEGIN { zone=""; forward=0 }
+    /zone "/ { zone=$2; gsub(/"/, "", zone); forward=0 }
+    /type[[:space:]]+forward/ { forward=1 }
+    /^};/ {
+      if (forward && zone != "") print zone
+      zone=""
+    }
+  ' "$NAMED_CONF")
+
+  if [ ${#forward_zones[@]} -eq 0 ]; then
+    dialog --msgbox "No forwarding zones found to edit." 6 50
+    return
+  fi
+
+  menu_args=()
+  for z in "${forward_zones[@]}"; do menu_args+=( "$z" "$z" ); done
+
+  exec 3>&1
+  selected_zone=$(dialog --clear --title "Edit Forwarding Zone" --menu "Select a forwarding zone to edit:" 20 60 10 "${menu_args[@]}" 2>&1 1>&3)
+  sel_rc=$?; exec 3>&-
+  [ $sel_rc -ne 0 ] || [ -z "$selected_zone" ] && return
+
+  # Extract only the block for the selected zone
+  awk -v zone="$selected_zone" '
+    BEGIN { inside=0 }
+    $0 ~ "zone \"" zone "\"" { inside=1 }
+    inside { print }
+    inside && /^};/ { exit }
+  ' "$NAMED_CONF" > "$STAGING_DIR/zone_edit.conf"
+
+  # Edit only the extracted block
+  tmpfile=$(mktemp)
+  cp "$STAGING_DIR/zone_edit.conf" "$tmpfile"
+
+  exec 3>&1
+  dialog --editbox "$tmpfile" 30 80 2>&1 1>&3
+  exec 3>&-
+
+  # Replace old block with new block
+  awk -v zone="$selected_zone" -v tmp="$tmpfile" '
+    BEGIN {
+      while ((getline line < tmp) > 0)
+        newblock = newblock line "\n"
+      close(tmp)
+    }
+    {
+      if ($0 ~ "zone \"" zone "\"") {
+        printing = 1
+        print newblock
+        next
+      }
+      if (printing && /^};/) {
+        printing = 0
+        next
+      }
+      if (printing) next
+      print
+    }
+  ' "$NAMED_CONF" > "$STAGING_DIR/named.conf.updated"
+
+  mv "$STAGING_DIR/named.conf.updated" "$NAMED_CONF"
+  finalize_file "$NAMED_CONF"
+
+  systemctl reload named || rndc reload || true
+  dialog --title "Success" --msgbox "Forwarding zone '$selected_zone' updated successfully." 6 60
+
+  rm -f "$tmpfile"
+}
+
+
+
+add_forwarding_zone() {
+  mkdir -p "$STAGING_DIR"
+  cp "$NAMED_CONF" "$STAGING_DIR/named.conf"
+
+  while true; do
+    exec 3>&1
+    zone=$(dialog --inputbox "Domain to forward (e.g., example.com):" 8 50 2>&1 1>&3)
+    exec 3>&-
+    [ -z "$zone" ] && return
+
+    if grep -q "zone \"$zone\"" "$NAMED_CONF"; then
+      dialog --msgbox "Zone '$zone' already exists." 6 50
+      continue
+    fi
+
+    exec 3>&1
+    forwarder=$(dialog --inputbox "IP address of the destination DNS server:" 8 50 2>&1 1>&3)
+    exec 3>&-
+    [ -z "$forwarder" ] && return
+
+    printf "\nzone \"%s\" {\n    type forward;\n    forward only;\n    forwarders { %s; };\n};\n" "$zone" "$forwarder" >> "$STAGING_DIR/named.conf"
+
+    mv "$STAGING_DIR/named.conf" "$NAMED_CONF"
+    finalize_file "$NAMED_CONF"
+
+    systemctl reload named || rndc reload || true
+    dialog --title "Success" --msgbox "Forwarding zone '$zone' created successfully." 6 60
+    break
+  done
+}
+
+# ─── Delete Forwarding Zone ────────────────────────────────────────────────────
+delete_forwarding_zone() {
+  mkdir -p "$STAGING_DIR"
+  cp "$NAMED_CONF" "$STAGING_DIR/named.conf"
+
+  mapfile -t forward_zones < <(awk '
+    BEGIN { zone=""; forward=0 }
+    /zone "/ { zone=$2; gsub(/"/, "", zone) }
+    /type[[:space:]]+forward/ { if (zone != "") print zone }
+  ' "$NAMED_CONF")
+
+  if [ ${#forward_zones[@]} -eq 0 ]; then
+    dialog --msgbox "No forwarding zones found to delete." 6 50
+    return
+  fi
+
+  menu_args=()
+  for z in "${forward_zones[@]}"; do menu_args+=( "$z" "$z" ); done
+
+  exec 3>&1
+  selected_zone=$(dialog --clear --title "Delete Forwarding Zone" --menu "Select a zone to delete:" 20 60 10 "${menu_args[@]}" 2>&1 1>&3)
+  sel_rc=$?; exec 3>&-
+  [ $sel_rc -ne 0 ] || [ -z "$selected_zone" ] && return
+
+  dialog --yesno "Are you sure you want to delete forwarding zone '$selected_zone'?" 7 60 || return
+
+  awk -v zone="$selected_zone" '
+    $0 ~ "zone \"" zone "\"" { skip=1; next }
+    skip && /^};/ { skip=0; next }
+    skip { next }
+    { print }
+  ' "$STAGING_DIR/named.conf" > "$STAGING_DIR/named.conf.tmp"
+
+  mv "$STAGING_DIR/named.conf.tmp" "$NAMED_CONF"
+  finalize_file "$NAMED_CONF"
+
+  systemctl reload named || rndc reload || true
+  dialog --title "Success" --msgbox "Forwarding zone '$selected_zone' deleted successfully." 6 60
+}
+
+
 
 add_zone() {
   rm -f "$STAGING_DIR"/db.* "$STAGING_DIR"/*.db.*
@@ -129,21 +294,53 @@ EOF
 }
 
 delete_zone() {
-  mapfile -t zones < <(list_zones | grep -v '\.in-addr\.arpa')
-  if [ ${#zones[@]} -eq 0 ]; then
+  mapfile -t zones < <(awk '
+    BEGIN { zone=""; forward=0; hint=0 }
+    /zone "/ {
+      zone=$2;
+      gsub(/"/, "", zone);
+      forward=0; hint=0;
+    }
+    /type[[:space:]]+forward/ { forward=1 }
+    /type[[:space:]]+hint/ { hint=1 }
+    /^};/ {
+      if (!forward && !hint && zone != "." && zone !~ /\.in-addr\.arpa$/) print zone
+      zone=""
+    }
+  ' "$NAMED_CONF" | sed '/^\s*$/d')
+
+  zone_count=${#zones[@]}
+  if [ "$zone_count" -eq 0 ]; then
     dialog --msgbox "No forward zones found to delete." 6 40
-    return
+    return 1
   fi
 
-  menu_args=()
-  for z in "${zones[@]}"; do menu_args+=( "$z" "$z" ); done
+  if [ "$zone_count" -eq 1 ]; then
+    selected_zone="${zones[0]}"
+    dialog --yesno "Only one forward zone:\n\n$selected_zone\n\nDelete it?" 10 60
+    del_rc=$?
+    if [ $del_rc -ne 0 ]; then
+      return 1
+    fi
+  else
+    menu_args=()
+    for z in "${zones[@]}"; do
+      menu_args+=( "$z" "$z" )
+    done
+    menu_height=$(( zone_count > 10 ? 10 : zone_count ))
+    [ "$menu_height" -lt 4 ] && menu_height=4
 
-  exec 3>&1
-  selected_zone=$(dialog --clear --title "Delete forward zone" --menu "Select a zone to delete:" 20 60 10 "${menu_args[@]}" 2>&1 1>&3)
-  sel_rc=$?; exec 3>&-
-  [ $sel_rc -ne 0 ] || [ -z "$selected_zone" ] && return
+    exec 3>&1
+    selected_zone=$(dialog --clear --title "Delete Forward Zone" --menu "Select a zone to delete:" 15 60 "$menu_height" "${menu_args[@]}" 2>&1 1>&3)
+    rc=$?; exec 3>&-
+    [ $rc -ne 0 ] || [ -z "$selected_zone" ] && return 1
 
-  dialog --yesno "Are you sure you want to delete forward zone '$selected_zone'?" 7 50 || return
+    dialog --yesno "Are you sure you want to delete forward zone '$selected_zone'?" 7 50
+    del_rc=$?
+    if [ $del_rc -ne 0 ]; then
+      return 1
+    fi
+  fi
 
   rndc freeze "$selected_zone" || true
 
@@ -160,7 +357,7 @@ delete_zone() {
   systemctl reload named || rndc reload || true
   rndc thaw "$selected_zone" || true
 
-  dialog --msgbox "Forward zone '$selected_zone' deleted and BIND reloaded." 6 50
+  dialog --title "Success" --msgbox "Forward zone '$selected_zone' deleted and BIND reloaded." 6 60
 }
 
 add_reverse_zone() {
@@ -202,21 +399,40 @@ EOF
   dialog --msgbox "Reverse zone '$full' created and applied." 6 50
 }
 delete_reverse_zone() {
-  mapfile -t zones < <(list_zones | grep '\.in-addr\.arpa')
+  mapfile -t zones < <(awk '
+    /zone "/ { zone=$2; gsub(/"/, "", zone); }
+    /type[[:space:]]+master/ && zone ~ /\.in-addr\.arpa$/ { print zone }
+  ' "$NAMED_CONF" | sed '/^\s*$/d')
+
   if [ ${#zones[@]} -eq 0 ]; then
     dialog --msgbox "No reverse zones found to delete." 6 40
-    return
+    return 1
   fi
 
-  menu_args=()
-  for z in "${zones[@]}"; do menu_args+=( "$z" "$z" ); done
+  if [ ${#zones[@]} -eq 1 ]; then
+    selected_zone="${zones[0]}"
+    dialog --yesno "Only one reverse zone:\n\n$selected_zone\n\nDelete it?" 10 60
+    del_rc=$?
+    if [ $del_rc -ne 0 ]; then
+      return 1
+    fi
+  else
+    menu_args=()
+    for z in "${zones[@]}"; do menu_args+=( "$z" "$z" ); done
+    menu_height=$(( ${#zones[@]} > 10 ? 10 : ${#zones[@]} ))
+    [ "$menu_height" -lt 4 ] && menu_height=4
 
-  exec 3>&1
-  selected_zone=$(dialog --clear --title "Delete reverse zone" --menu "Select a reverse zone to delete:" 20 60 10 "${menu_args[@]}" 2>&1 1>&3)
-  sel_rc=$?; exec 3>&-
-  [ $sel_rc -ne 0 ] || [ -z "$selected_zone" ] && return
+    exec 3>&1
+    selected_zone=$(dialog --clear --title "Delete Reverse Zone" --menu "Select a reverse zone to delete:" 15 60 "$menu_height" "${menu_args[@]}" 2>&1 1>&3)
+    rc=$?; exec 3>&-
+    [ $rc -ne 0 ] || [ -z "$selected_zone" ] && return 1
 
-  dialog --yesno "Are you sure you want to delete reverse zone '$selected_zone'?" 7 50 || return
+    dialog --yesno "Are you sure you want to delete reverse zone '$selected_zone'?" 7 50
+    del_rc=$?
+    if [ $del_rc -ne 0 ]; then
+      return 1
+    fi
+  fi
 
   rndc freeze "$selected_zone" || true
 
@@ -226,7 +442,6 @@ delete_reverse_zone() {
     skip { next }
     { print }
   ' "$NAMED_CONF" > "$STAGING_DIR/named.conf"
-
   mv "$STAGING_DIR/named.conf" "$NAMED_CONF"
   rm -f "$ZONE_DIR/db.${selected_zone%.in-addr.arpa}"
   finalize_file "$NAMED_CONF"
@@ -238,53 +453,80 @@ delete_reverse_zone() {
 
 # ─── Manual Edit Function ─────────────────────────────────────────────────────
 edit_dns_records() {
-  while true; do
-    mapfile -t zones < <(list_zones)
-    [ ${#zones[@]} -gt 0 ] || { dialog --msgbox "No zones to edit." 6 40; return; }
-    menu=(); for z in "${zones[@]}"; do menu+=( "$z" "$z" ); done
+  mapfile -t zones < <(awk '
+    BEGIN { zone=""; forward=0; hint=0 }
+    /zone "/ {
+      zone=$2; gsub(/"/, "", zone);
+      forward=0; hint=0;
+    }
+    /type[[:space:]]+forward/ { forward=1 }
+    /type[[:space:]]+hint/ { hint=1 }
+    /^};/ {
+      if (!forward && !hint && zone != "") print zone;
+      zone=""
+    }
+  ' "$NAMED_CONF" | sed '/^\s*$/d')
 
-    exec 3>&1; set +e
-    sel=$(dialog --clear --title "Select zone" --menu "Cancel→back:" 20 60 10 \
-          "${menu[@]}" 2>&1 1>&3)
-    rc=$?; set -e; exec 3>&-
-    [ $rc -ne 0 ] && return
+  [ ${#zones[@]} -eq 0 ] && { dialog --msgbox "No zones to edit." 6 40; return; }
 
-    file=$([[ "$sel" =~ \.in-addr\.arpa$ ]] \
-           && echo "$ZONE_DIR/db.${sel%.in-addr.arpa}" \
-           || echo "$ZONE_DIR/db.$sel")
-    [ -f "$file" ] || { dialog --msgbox "Not found." 6 40; continue; }
+  menu=(); for z in "${zones[@]}"; do menu+=( "$z" "$z" ); done
+  height=$(( ${#zones[@]} > 10 ? 10 : ${#zones[@]} ))
+  [ "$height" -lt 4 ] && height=4
 
-    rndc freeze "$sel" >/dev/null 2>&1 || true
-    tmp=$(mktemp); cp "$file" "$tmp"; out=$(mktemp)
+  exec 3>&1; set +e
+  sel=$(dialog --clear --title "Select zone" --menu "Cancel→back:" 20 60 "$height" "${menu[@]}" 2>&1 1>&3)
+  rc=$?; set -e; exec 3>&-
+  [ $rc -ne 0 ] && return
 
-    exec 3>&1; set +e
-    dialog --clear --title "Editing $sel" --editbox "$tmp" 25 80 \
-      2>"$out" 1>&3
-    erc=$?; set -e; exec 3>&-
-    rm -f "$tmp"
-    if [ $erc -eq 0 ]; then
-      mv "$out" "$file"
-      finalize_file "$file"
-      systemctl reload named || rndc reload || true
-      dialog --msgbox "Zone '$sel' updated and applied." 6 50
-    else
-      rm -f "$out"
-    fi
-    rndc thaw "$sel" >/dev/null 2>&1 || true
-  done
+  file=$([[ "$sel" =~ \.in-addr\.arpa$ ]] && echo "$ZONE_DIR/db.${sel%.in-addr.arpa}" || echo "$ZONE_DIR/db.$sel")
+  [ -f "$file" ] || { dialog --msgbox "Zone file not found." 6 40; return; }
+
+  rndc freeze "$sel" >/dev/null 2>&1 || true
+  tmp=$(mktemp); cp "$file" "$tmp"; out=$(mktemp)
+  exec 3>&1; set +e
+  dialog --editbox "$tmp" 25 80 2>"$out" 1>&3
+  erc=$?; set -e; exec 3>&-; rm -f "$tmp"
+  if [ $erc -eq 0 ]; then
+    mv "$out" "$file"
+    finalize_file "$file"
+    systemctl reload named || rndc reload || true
+    dialog --msgbox "Zone '$sel' updated and applied." 6 50
+  else
+    rm -f "$out"
+  fi
+  rndc thaw "$sel" >/dev/null 2>&1 || true
 }
 
 # ─── Structured Record Manager ───────────────────────────────────────────────
 manage_dns_records() {
   while true; do
-    mapfile -t zones < <(list_zones)
+mapfile -t zones < <(awk '
+  BEGIN { zone=""; forward=0; hint=0 }
+  /zone "/ {
+    zone=$2; gsub(/"/, "", zone);
+    forward=0; hint=0;
+  }
+  /type[[:space:]]+forward/ { forward=1 }
+  /type[[:space:]]+hint/ { hint=1 }
+  /^};/ {
+    if (!forward && !hint && zone != "") print zone;
+    zone=""
+  }
+' "$NAMED_CONF" | sed '/^\s*$/d')
+
     [ ${#zones[@]} -eq 0 ] && { dialog --msgbox "No DNS zones found." 6 40; return; }
 
     menu_args=(); for z in "${zones[@]}"; do menu_args+=( "$z" "$z" ); done
+
+    zone_count=${#zones[@]}
+    menu_height=$(( zone_count > 10 ? 10 : zone_count ))
+    [ "$menu_height" -lt 4 ] && menu_height=4
+
     exec 3>&1; set +e
-    selected_zone=$(dialog --clear --title "Manage DNS Records" --menu "Select a zone (Cancel→main menu):" 20 60 10 "${menu_args[@]}" 2>&1 1>&3)
+    selected_zone=$(dialog --clear --title "Manage DNS Records" \
+      --menu "Select a zone (Cancel→main menu):" 20 60 "$menu_height" "${menu_args[@]}" 2>&1 1>&3)
     sel_rc=$?; set -e; exec 3>&-
-    [ $sel_rc -ne 0 ] && return
+   [ $sel_rc -ne 0 ] && return
 
     zone_file="$ZONE_DIR/db.${selected_zone%.in-addr.arpa}"
     [ -f "$zone_file" ] || { dialog --msgbox "Zone file not found." 6 40; continue; }
@@ -383,30 +625,43 @@ manage_dns_records() {
 }
 
 # ─── Modify Zones Submenu ────────────────────────────────────────────────────
-
 modify_zones_menu() {
   while true; do
     exec 3>&1
-    c=$(dialog --clear --title "Modify Zones" --menu "" 15 60 6 \
+    choice=$(dialog --clear --title "Modify Zones" --menu "Choose an action:" 15 60 8 \
       1 "List All Zones" \
       2 "Add Forward Zone" \
       3 "Delete Forward Zone" \
       4 "Add Reverse Zone" \
       5 "Delete Reverse Zone" \
-      6 "Back" \
+      6 "Create Forwarding Zone" \
+      7 "Delete Forwarding Zone" \
+      8 "Back" \
       2>&1 1>&3)
     rc=$?; exec 3>&-
     [ $rc -ne 0 ] && break
-    case $c in
+
+    case "$choice" in
       1) show_zones ;;
       2) add_zone ;;
-      3) delete_zone ;;
+      3)
+        if ! delete_zone; then
+          continue
+        fi
+        ;;
       4) add_reverse_zone ;;
-      5) delete_reverse_zone ;;
-      6) break ;;
+      5)
+        if ! delete_reverse_zone; then
+          continue
+        fi
+        ;;
+      6) create_forwarding_zone ;;
+      7) delete_forwarding_zone ;;
+      8) break ;;
     esac
   done
 }
+
 
 # ─── Main Menu ────────────────────────────────────────────────────────────────
 main_menu() {
@@ -418,8 +673,9 @@ main_menu() {
                1 "Modify Zones" \
                2 "Manage DNS Records" \
                3 "Manually Edit Zone Records" \
-               4 "named Service Control" \
-               5 "Exit" \
+               4 "Manually Edit Forwarding Zones" \
+               5 "named Service Control" \
+               6 "Exit" \
         2>&1 1>&3
     )
     rc=$?; set -e; exec 3>&-
@@ -429,12 +685,14 @@ main_menu() {
       1) modify_zones_menu   ;;
       2) manage_dns_records ;;
       3) edit_dns_records   ;;
-      4) named_service_menu ;;
-      5) clear; exit 0      ;;
+      4) edit_forwarding_zones ;;
+      5) named_service_menu ;;
+      6) clear; exit 0      ;;
     esac
   done
   clear
 }
+
 
 # ─── Startup ─────────────────────────────────────────────────────────────────
 if ! command -v dialog &>/dev/null; then
