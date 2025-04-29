@@ -43,6 +43,22 @@ named_service_menu() {
 
 # ─── Utility Functions ────────────────────────────────────────────────────────
 
+list_records_for_zone() {
+  local zone="$1"
+  local file
+
+  file=$([[ "$zone" =~ \.in-addr\.arpa$ ]] \
+         && echo "$ZONE_DIR/db.${zone%.in-addr.arpa}" \
+         || echo "$ZONE_DIR/db.$zone")
+
+  if [ -f "$file" ]; then
+    grep -v '^[[:space:]]*$' "$file" > "$STAGING_DIR/zone_records.txt"
+    dialog --title "Records in $zone" --textbox "$STAGING_DIR/zone_records.txt" 25 80
+  else
+    dialog --msgbox "Zone file for '$zone' not found." 6 50
+  fi
+}
+
 list_zones() {
   grep 'zone\s\+"' "$NAMED_CONF" | cut -d'"' -f2
 }
@@ -101,6 +117,126 @@ increment_soa_serial() {
 
 # ─── Zone‑Management Handlers ─────────────────────────────────────────────────
 
+add_record_to_zone() {
+  local selected_zone="$1"
+  local zone_file="$2"
+  local is_reverse="$3"
+
+  if $is_reverse; then
+    rec_menu=( PTR "PTR Record" OTHER "Other" )
+  else
+    rec_menu=( A "A Record" MX "MX Record" CNAME "CNAME Record" SRV "SRV Record" TXT "TXT Record" OTHER "Other" )
+  fi
+
+  exec 3>&1; set +e
+  rtype=$(dialog --clear --title "Add Record" --menu "Select type (Cancel→back):" 15 60 $(( ${#rec_menu[@]} / 2 )) "${rec_menu[@]}" 2>&1 1>&3)
+  rt_rc=$?; set -e; exec 3>&-
+  [ $rt_rc -ne 0 ] && return 1
+
+  case "$rtype" in
+    A)
+      exec 3>&1; name=$(dialog --inputbox "Hostname (e.g., www):" 8 40 2>&1 1>&3); exec 3>&-
+      exec 3>&1; ip=$(dialog --inputbox "IP address:" 8 40 2>&1 1>&3); exec 3>&-
+      [[ -z "$name" || -z "$ip" ]] && return 1
+
+      echo -e "$name\tIN\tA\t$ip" >> "$zone_file"
+      increment_soa_serial "$zone_file"
+      finalize_file "$zone_file"
+      systemctl reload named || rndc reload || true
+      dialog --msgbox "A record added for $name → $ip" 6 50
+
+      # ==== PTR auto-suggestion logic starts here ====
+      ip_base=$(echo "$ip" | awk -F. '{print $1"."$2"."$3}')
+      ip_last=$(echo "$ip" | awk -F. '{print $4}')
+      reverse_zone_name="$(echo "$ip_base" | awk -F. '{print $3"."$2"."$1}').in-addr.arpa"
+      reverse_zone_file="$ZONE_DIR/db.$(echo "$ip_base" | awk -F. '{print $3"."$2"."$1}')"
+
+      if grep -q "zone \"$reverse_zone_name\"" "$NAMED_CONF"; then
+        dialog --yesno "Reverse zone '$reverse_zone_name' found.\n\nWould you like to automatically create a matching PTR for '$name'?" 10 60
+        ptr_rc=$?
+        if [ $ptr_rc -eq 0 ]; then
+          if [ -f "$reverse_zone_file" ]; then
+            if grep -q "^$ip_last[[:space:]]\+IN[[:space:]]\+PTR" "$reverse_zone_file"; then
+              dialog --yesno "A PTR already exists for $ip_last.\n\nWould you like to replace it?" 10 60
+              replace_rc=$?
+              if [ $replace_rc -eq 0 ]; then
+                sed -i "/^$ip_last[[:space:]]\+IN[[:space:]]\+PTR/d" "$reverse_zone_file"
+              else
+                dialog --msgbox "PTR update cancelled. No changes made to reverse zone." 6 50
+                return 0
+              fi
+            fi
+            # Add new PTR
+            fqdn="${name}.${selected_zone}."
+            echo -e "$ip_last\tIN\tPTR\t$fqdn" >> "$reverse_zone_file"
+            increment_soa_serial "$reverse_zone_file"
+            finalize_file "$reverse_zone_file"
+            systemctl reload named || rndc reload || true
+            dialog --msgbox "PTR record added to $reverse_zone_name:\n$ip_last → $fqdn" 8 60
+          else
+            dialog --msgbox "Reverse zone file '$reverse_zone_file' not found.\nPTR not added." 6 50
+          fi
+        fi
+      fi
+      ;;
+    PTR)
+      exec 3>&1; last=$(dialog --inputbox "Last octet of IP (e.g., 55):" 8 40 2>&1 1>&3); exec 3>&-
+      exec 3>&1; host=$(dialog --inputbox "FQDN target (e.g., server.example.com.):" 8 60 2>&1 1>&3); exec 3>&-
+      [[ -n "$last" && -n "$host" ]] && echo -e "$last\tIN\tPTR\t$host" >> "$zone_file"
+      increment_soa_serial "$zone_file"
+      finalize_file "$zone_file"
+      systemctl reload named || rndc reload || true
+      dialog --msgbox "PTR record added." 5 40
+      ;;
+    MX)
+      exec 3>&1; prio=$(dialog --inputbox "MX priority:" 8 40 2>&1 1>&3); exec 3>&-
+      exec 3>&1; mail=$(dialog --inputbox "Mail server FQDN:" 8 60 2>&1 1>&3); exec 3>&-
+      [[ -n "$prio" && -n "$mail" ]] && echo -e "@\tIN\tMX\t$prio\t$mail" >> "$zone_file"
+      increment_soa_serial "$zone_file"
+      finalize_file "$zone_file"
+      systemctl reload named || rndc reload || true
+      dialog --msgbox "MX record added." 5 40
+      ;;
+    CNAME)
+      exec 3>&1; name=$(dialog --inputbox "Alias hostname (e.g., www):" 8 40 2>&1 1>&3); exec 3>&-
+      exec 3>&1; cname=$(dialog --inputbox "Canonical hostname (FQDN):" 8 60 2>&1 1>&3); exec 3>&-
+      [[ -n "$name" && -n "$cname" ]] && echo -e "$name\tIN\tCNAME\t$cname" >> "$zone_file"
+      increment_soa_serial "$zone_file"
+      finalize_file "$zone_file"
+      systemctl reload named || rndc reload || true
+      dialog --msgbox "CNAME record added." 5 40
+      ;;
+    SRV)
+      exec 3>&1; srv=$(dialog --inputbox "SRV name (_service._proto):" 8 60 2>&1 1>&3); exec 3>&-
+      exec 3>&1; val=$(dialog --inputbox "Priority Weight Port Target:" 8 60 2>&1 1>&3); exec 3>&-
+      [[ -n "$srv" && -n "$val" ]] && echo -e "$srv\tIN\tSRV\t$val" >> "$zone_file"
+      increment_soa_serial "$zone_file"
+      finalize_file "$zone_file"
+      systemctl reload named || rndc reload || true
+      dialog --msgbox "SRV record added." 5 40
+      ;;
+    TXT)
+      exec 3>&1; txtname=$(dialog --inputbox "TXT record name (or @):" 8 40 2>&1 1>&3); exec 3>&-
+      exec 3>&1; txtval=$(dialog --inputbox "TXT value:" 8 60 2>&1 1>&3); exec 3>&-
+      [[ -n "$txtname" && -n "$txtval" ]] && echo -e "$txtname\tIN\tTXT\t\"$txtval\"" >> "$zone_file"
+      increment_soa_serial "$zone_file"
+      finalize_file "$zone_file"
+      systemctl reload named || rndc reload || true
+      dialog --msgbox "TXT record added." 5 40
+      ;;
+    OTHER)
+      exec 3>&1; raw=$(dialog --inputbox "Raw BIND record line:" 10 70 2>&1 1>&3); exec 3>&-
+      [ -n "$raw" ] && echo "$raw" >> "$zone_file"
+      increment_soa_serial "$zone_file"
+      finalize_file "$zone_file"
+      systemctl reload named || rndc reload || true
+      dialog --msgbox "Custom record added." 5 40
+      ;;
+  esac
+}
+
+
+
 # ─── Add Forwarding Zone ──────────────────────────────────────────────────────
 edit_forwarding_zones() {
   mkdir -p "$STAGING_DIR"
@@ -114,11 +250,11 @@ edit_forwarding_zones() {
       if (forward && zone != "") print zone
       zone=""
     }
-  ' "$NAMED_CONF")
+  ' "$NAMED_CONF" | sed '/^\s*$/d')
 
   if [ ${#forward_zones[@]} -eq 0 ]; then
     dialog --msgbox "No forwarding zones found to edit." 6 50
-    return
+    return 1
   fi
 
   menu_args=()
@@ -127,7 +263,7 @@ edit_forwarding_zones() {
   exec 3>&1
   selected_zone=$(dialog --clear --title "Edit Forwarding Zone" --menu "Select a forwarding zone to edit:" 20 60 10 "${menu_args[@]}" 2>&1 1>&3)
   sel_rc=$?; exec 3>&-
-  [ $sel_rc -ne 0 ] || [ -z "$selected_zone" ] && return
+  [ $sel_rc -ne 0 ] || [ -z "$selected_zone" ] && return 1
 
   # Extract only the block for the selected zone
   awk -v zone="$selected_zone" '
@@ -137,16 +273,20 @@ edit_forwarding_zones() {
     inside && /^};/ { exit }
   ' "$NAMED_CONF" > "$STAGING_DIR/zone_edit.conf"
 
-  # Edit only the extracted block
   tmpfile=$(mktemp)
   cp "$STAGING_DIR/zone_edit.conf" "$tmpfile"
 
   exec 3>&1
-  dialog --editbox "$tmpfile" 30 80 2>&1 1>&3
-  exec 3>&-
+  dialog --editbox "$tmpfile" 30 80 2>"$tmpfile.edited"
+  edit_rc=$?; exec 3>&-
+
+  if [ $edit_rc -ne 0 ]; then
+    rm -f "$tmpfile" "$tmpfile.edited"
+    return 1
+  fi
 
   # Replace old block with new block
-  awk -v zone="$selected_zone" -v tmp="$tmpfile" '
+  awk -v zone="$selected_zone" -v tmp="$tmpfile.edited" '
     BEGIN {
       while ((getline line < tmp) > 0)
         newblock = newblock line "\n"
@@ -169,16 +309,16 @@ edit_forwarding_zones() {
 
   mv "$STAGING_DIR/named.conf.updated" "$NAMED_CONF"
   finalize_file "$NAMED_CONF"
-
   systemctl reload named || rndc reload || true
+
   dialog --title "Success" --msgbox "Forwarding zone '$selected_zone' updated successfully." 6 60
 
-  rm -f "$tmpfile"
+  rm -f "$tmpfile" "$tmpfile.edited"
 }
 
 
 
-add_forwarding_zone() {
+create_forwarding_zone() {
   mkdir -p "$STAGING_DIR"
   cp "$NAMED_CONF" "$STAGING_DIR/named.conf"
 
@@ -499,129 +639,112 @@ edit_dns_records() {
 
 # ─── Structured Record Manager ───────────────────────────────────────────────
 manage_dns_records() {
+  mapfile -t zones < <(awk '
+    BEGIN { zone=""; forward=0; hint=0 }
+    /zone "/ {
+      zone=$2; gsub(/"/, "", zone);
+      forward=0; hint=0;
+    }
+    /type[[:space:]]+forward/ { forward=1 }
+    /type[[:space:]]+hint/ { hint=1 }
+    /^};/ {
+      if (!forward && !hint && zone != "") print zone;
+      zone=""
+    }
+  ' "$NAMED_CONF" | sed '/^\s*$/d')
+
+  [ ${#zones[@]} -eq 0 ] && { dialog --msgbox "No DNS zones found." 6 40; return; }
+
+  menu_args=(); for z in "${zones[@]}"; do menu_args+=( "$z" "$z" ); done
+  zone_count=${#zones[@]}
+  menu_height=$(( zone_count > 10 ? 10 : zone_count ))
+  [ "$menu_height" -lt 4 ] && menu_height=4
+
+  exec 3>&1; set +e
+  selected_zone=$(dialog --clear --title "Manage DNS Records" --menu "Select a zone (Cancel→main menu):" 20 60 "$menu_height" "${menu_args[@]}" 2>&1 1>&3)
+  sel_rc=$?; set -e; exec 3>&-
+  [ $sel_rc -ne 0 ] && return
+
+  zone_file="$ZONE_DIR/db.${selected_zone%.in-addr.arpa}"
+  [ -f "$zone_file" ] || { dialog --msgbox "Zone file not found." 6 40; return; }
+  rndc freeze "$selected_zone" >/dev/null 2>&1 || true
+
+  is_reverse=false
+  [[ "$selected_zone" =~ \.in-addr\.arpa$ ]] && is_reverse=true
+
   while true; do
-mapfile -t zones < <(awk '
-  BEGIN { zone=""; forward=0; hint=0 }
-  /zone "/ {
-    zone=$2; gsub(/"/, "", zone);
-    forward=0; hint=0;
-  }
-  /type[[:space:]]+forward/ { forward=1 }
-  /type[[:space:]]+hint/ { hint=1 }
-  /^};/ {
-    if (!forward && !hint && zone != "") print zone;
-    zone=""
-  }
-' "$NAMED_CONF" | sed '/^\s*$/d')
+  exec 3>&1; set +e
+  action=$(dialog --clear --title "Zone: $selected_zone" --menu "Choose action (Cancel→zone select):" 20 60 8 \
+    1 "Add Record" \
+    2 "Delete Record" \
+    3 "List Records" \
+    4 "Return" \
+    2>&1 1>&3)
+  act_rc=$?; set -e; exec 3>&-
+  [ $act_rc -ne 0 ] && break
 
-    [ ${#zones[@]} -eq 0 ] && { dialog --msgbox "No DNS zones found." 6 40; return; }
 
-    menu_args=(); for z in "${zones[@]}"; do menu_args+=( "$z" "$z" ); done
+    case "$action" in
+      1)
+        if ! add_record_to_zone "$selected_zone" "$zone_file" "$is_reverse"; then
+          continue
+        fi
+        ;;
+      2)
+        mapfile -t recs < <(grep -v '^[[:space:]]*$' "$zone_file")
+        [ ${#recs[@]} -gt 0 ] || { dialog --msgbox "No records." 5 40; continue; }
+        menu_args=(); for i in "${!recs[@]}"; do idx=$((i+1)); menu_args+=( "$idx" "${recs[i]}" ); done
 
-    zone_count=${#zones[@]}
-    menu_height=$(( zone_count > 10 ? 10 : zone_count ))
-    [ "$menu_height" -lt 4 ] && menu_height=4
+        exec 3>&1; set +e
+        sel=$(dialog --clear --title "Delete Record" --menu "Cancel→back:" 20 70 15 "${menu_args[@]}" 2>&1 1>&3)
+        drc=$?; set -e; exec 3>&-
+        [ $drc -ne 0 ] && continue
 
-    exec 3>&1; set +e
-    selected_zone=$(dialog --clear --title "Manage DNS Records" \
-      --menu "Select a zone (Cancel→main menu):" 20 60 "$menu_height" "${menu_args[@]}" 2>&1 1>&3)
-    sel_rc=$?; set -e; exec 3>&-
-   [ $sel_rc -ne 0 ] && return
+        record="${recs[sel-1]}"
+        sed -i "${sel}d" "$zone_file"
+        increment_soa_serial "$zone_file"
+        finalize_file "$zone_file"
+        systemctl reload named || rndc reload || true
+        dialog --msgbox "Record deleted." 5 40
 
-    zone_file="$ZONE_DIR/db.${selected_zone%.in-addr.arpa}"
-    [ -f "$zone_file" ] || { dialog --msgbox "Zone file not found." 6 40; continue; }
-    rndc freeze "$selected_zone" >/dev/null 2>&1 || true
+        # === PTR cleanup if A record ===
+        if ! $is_reverse && [[ "$record" =~ IN[[:space:]]+A[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+          ip="${BASH_REMATCH[1]}"
+          ip_base=$(echo "$ip" | awk -F. '{print $1"."$2"."$3}')
+          ip_last=$(echo "$ip" | awk -F. '{print $4}')
+          reverse_zone_name="$(echo "$ip_base" | awk -F. '{print $3"."$2"."$1}').in-addr.arpa"
+          reverse_zone_file="$ZONE_DIR/db.$(echo "$ip_base" | awk -F. '{print $3"."$2"."$1}')"
 
-    is_reverse=false
-    [[ "$selected_zone" =~ \.in-addr\.arpa$ ]] && is_reverse=true
-
-    while true; do
-      exec 3>&1; set +e
-      action=$(dialog --clear --title "Zone: $selected_zone" --menu "Choose action (Cancel→zone select):" 20 60 6 \
-        1 "Add Record" \
-        2 "Delete Record" \
-        3 "Return" \
-        2>&1 1>&3)
-      act_rc=$?; set -e; exec 3>&-
-      [ $act_rc -ne 0 ] && break
-
-      case "$action" in
-        1)
-          if $is_reverse; then rec_menu=( PTR "PTR Record" )
-          else rec_menu=( A "A Record" PTR "PTR Record" MX "MX Record" SRV "SRV Record" OTHER "Other" ); fi
-
-          exec 3>&1; set +e
-          rtype=$(dialog --clear --title "Add Record" --menu "Select type (Cancel→back):" 15 50 $(( ${#rec_menu[@]} / 2 )) "${rec_menu[@]}" 2>&1 1>&3)
-          rt_rc=$?; set -e; exec 3>&-
-          [ $rt_rc -ne 0 ] && continue
-
-          case "$rtype" in
-            A)
-              exec 3>&1; name=$(dialog --inputbox "Hostname (e.g. www):" 8 40 2>&1 1>&3); exec 3>&-
-              exec 3>&1; ip=$(dialog --inputbox "IP address:" 8 40 2>&1 1>&3); exec 3>&-
-              [[ -n "$name" && -n "$ip" ]] && echo -e "$name	IN	A	$ip" >> "$zone_file"
-              ;;
-            PTR)
-              mapfile -t fwdzones < <(list_zones | grep -v '\.in-addr\.arpa')
-              if [ ${#fwdzones[@]} -gt 1 ]; then
-                fwd_menu=(); for z in "${fwdzones[@]}"; do fwd_menu+=( "$z" "$z" ); done
-                exec 3>&1; set +e
-                chosen_fwd=$(dialog --clear --title "Select forward zone" --menu "Which zone for PTR target?" 15 60 ${#fwdzones[@]} "${fwd_menu[@]}" 2>&1 1>&3)
-                set -e; exec 3>&-
-                [ -z "$chosen_fwd" ] && continue
-              else
-                chosen_fwd="${fwdzones[0]}"
+          if grep -q "zone \"$reverse_zone_name\"" "$NAMED_CONF"; then
+            if [ -f "$reverse_zone_file" ]; then
+              if grep -q "^$ip_last[[:space:]]\+IN[[:space:]]\+PTR" "$reverse_zone_file"; then
+                dialog --yesno "Matching PTR record found in '$reverse_zone_name'.\nDelete it too?" 8 60
+                ptr_rc=$?
+                if [ $ptr_rc -eq 0 ]; then
+                  sed -i "/^$ip_last[[:space:]]\+IN[[:space:]]\+PTR/d" "$reverse_zone_file"
+                  increment_soa_serial "$reverse_zone_file"
+                  finalize_file "$reverse_zone_file"
+                  systemctl reload named || rndc reload || true
+                  dialog --msgbox "PTR record deleted from reverse zone." 6 50
+                fi
               fi
-              exec 3>&1; host=$(dialog --inputbox "Hostname in $chosen_fwd (no dot):" 8 50 2>&1 1>&3); exec 3>&-
-              exec 3>&1; ip=$(dialog --inputbox "IP address:" 8 40 2>&1 1>&3); exec 3>&-
-              last=${ip##*.}
-              fqdn="$host.$chosen_fwd."
-              [[ -n "$last" && -n "$fqdn" ]] && echo -e "$last	IN	PTR	$fqdn" >> "$zone_file"
-              ;;
-            MX)
-              exec 3>&1; prio=$(dialog --inputbox "MX priority:" 8 40 2>&1 1>&3); exec 3>&-
-              exec 3>&1; mail=$(dialog --inputbox "Mail server (FQDN):" 8 60 2>&1 1>&3); exec 3>&-
-              [[ -n "$prio" && -n "$mail" ]] && echo -e "@	IN	MX	$prio $mail" >> "$zone_file"
-              ;;
-            SRV)
-              exec 3>&1; srv=$(dialog --inputbox "SRV name (_svc._proto):" 8 60 2>&1 1>&3); exec 3>&-
-              exec 3>&1; val=$(dialog --inputbox "Priority Weight Port Target:" 8 60 2>&1 1>&3); exec 3>&-
-              [[ -n "$srv" && -n "$val" ]] && echo -e "$srv	IN	SRV	$val" >> "$zone_file"
-              ;;
-            OTHER)
-              exec 3>&1; raw=$(dialog --inputbox "Raw BIND line:" 10 70 2>&1 1>&3); exec 3>&-
-              [ -n "$raw" ] && echo "$raw" >> "$zone_file"
-              ;;
-          esac
-          increment_soa_serial "$zone_file"
-          finalize_file "$zone_file"
-          systemctl reload named || rndc reload || true
-          dialog --msgbox "$rtype record added." 5 40
-          ;;
+            fi
+          fi
+        fi
+        ;;
 
-        2)
-          mapfile -t recs < <(grep -v '^[[:space:]]*$' "$zone_file")
-          [ ${#recs[@]} -gt 0 ] || { dialog --msgbox "No records." 5 40; continue; }
-          menu_args=(); for i in "${!recs[@]}"; do idx=$((i+1)); menu_args+=( "$idx" "${recs[i]}" ); done
-          exec 3>&1; set +e
-          sel=$(dialog --clear --title "Delete Record" --menu "Cancel→back:" 20 70 15 "${menu_args[@]}" 2>&1 1>&3)
-          drc=$?; set -e; exec 3>&-
-          [ $drc -ne 0 ] && continue
-          sed -i "${sel}d" "$zone_file"
-          increment_soa_serial "$zone_file"
-          finalize_file "$zone_file"
-          systemctl reload named || rndc reload || true
-          dialog --msgbox "Record deleted." 5 40
-          ;;
-        3)
-          rndc thaw "$selected_zone" >/dev/null 2>&1 || true
-          break 2
-          ;;
-        esac
-      done
+      3)
+      list_records_for_zone "$selected_zone"
+      ;;
 
-    rndc thaw "$selected_zone" >/dev/null 2>&1 || true
+      4)
+        rndc thaw "$selected_zone" >/dev/null 2>&1 || true
+        break
+        ;;
+    esac
   done
+
+  rndc thaw "$selected_zone" >/dev/null 2>&1 || true
 }
 
 # ─── Modify Zones Submenu ────────────────────────────────────────────────────
@@ -669,7 +792,7 @@ main_menu() {
     exec 3>&1; set +e
     c=$(
       dialog --clear --title "DNS Management" \
-             --menu "" 15 60 5 \
+             --menu "" 15 60 6 \
                1 "Modify Zones" \
                2 "Manage DNS Records" \
                3 "Manually Edit Zone Records" \
@@ -682,12 +805,16 @@ main_menu() {
     [ $rc -ne 0 ] && break
 
     case $c in
-      1) modify_zones_menu   ;;
+      1) modify_zones_menu ;;
       2) manage_dns_records ;;
-      3) edit_dns_records   ;;
-      4) edit_forwarding_zones ;;
+      3) edit_dns_records ;;
+      4)
+        if ! edit_forwarding_zones; then
+          continue
+        fi
+        ;;
       5) named_service_menu ;;
-      6) clear; exit 0      ;;
+      6) clear; exit 0 ;;
     esac
   done
   clear
