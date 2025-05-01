@@ -322,31 +322,47 @@ create_forwarding_zone() {
   mkdir -p "$STAGING_DIR"
   cp "$NAMED_CONF" "$STAGING_DIR/named.conf"
 
-  while true; do
-    exec 3>&1
-    zone=$(dialog --inputbox "Domain to forward (e.g., example.com):" 8 50 2>&1 1>&3)
-    exec 3>&-
-    [ -z "$zone" ] && return
+  exec 3>&1
+  type_choice=$(dialog --title "Forwarding Zone Type" --menu "Select forwarding type:" 10 60 2 \
+    1 "Forward name → IP (e.g. example.com)" \
+    2 "Forward IP → Name (e.g. 192.168.10.0)" \
+    2>&1 1>&3)
+  rc=$?; exec 3>&-
+  [ $rc -ne 0 ] && return
 
-    if grep -q "zone \"$zone\"" "$NAMED_CONF"; then
-      dialog --msgbox "Zone '$zone' already exists." 6 50
-      continue
-    fi
+  case "$type_choice" in
+    1)
+      exec 3>&1
+      zone=$(dialog --inputbox "Domain to forward (e.g. example.com):" 8 50 2>&1 1>&3)
+      exec 3>&-
+      [ -z "$zone" ] && return
+      ;;
+    2)
+      exec 3>&1
+      ip_base=$(dialog --inputbox "Reverse base (e.g. 192.168.10.0):" 8 50 2>&1 1>&3)
+      exec 3>&-
+      [ -z "$ip_base" ] && return
+      zone="$(echo "$ip_base" | awk -F. '{print $3"."$2"."$1}').in-addr.arpa"
+      ;;
+  esac
 
-    exec 3>&1
-    forwarder=$(dialog --inputbox "IP address of the destination DNS server:" 8 50 2>&1 1>&3)
-    exec 3>&-
-    [ -z "$forwarder" ] && return
+  if grep -q "zone \"$zone\"" "$NAMED_CONF"; then
+    dialog --msgbox "Zone '$zone' already exists." 6 50
+    return
+  fi
 
-    printf "\nzone \"%s\" {\n    type forward;\n    forward only;\n    forwarders { %s; };\n};\n" "$zone" "$forwarder" >> "$STAGING_DIR/named.conf"
+  exec 3>&1
+  forwarder=$(dialog --inputbox "IP address of destination DNS server:" 8 50 2>&1 1>&3)
+  exec 3>&-
+  [ -z "$forwarder" ] && return
 
-    mv "$STAGING_DIR/named.conf" "$NAMED_CONF"
-    finalize_file "$NAMED_CONF"
+  printf "\nzone \"%s\" {\n    type forward;\n    forward only;\n    forwarders { %s; };\n};\n" "$zone" "$forwarder" >> "$STAGING_DIR/named.conf"
 
-    systemctl reload named || rndc reload || true
-    dialog --title "Success" --msgbox "Forwarding zone '$zone' created successfully." 6 60
-    break
-  done
+  mv "$STAGING_DIR/named.conf" "$NAMED_CONF"
+  finalize_file "$NAMED_CONF"
+
+  systemctl reload named || rndc reload || true
+  dialog --title "Success" --msgbox "Forwarding zone '$zone' created successfully." 6 60
 }
 
 # ─── Delete Forwarding Zone ────────────────────────────────────────────────────
@@ -513,7 +529,24 @@ add_reverse_zone() {
   done
 
   host=$(hostnamectl status | awk '/Static hostname:/ {print $3}')
-  last=${base##*.}
+
+  ip_list=($(ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1))
+  suggested_ip=""
+  for ip in "${ip_list[@]}"; do
+    prefix=$(echo "$ip" | cut -d. -f1-3)
+    base_prefix=$(echo "$base" | cut -d. -f1-3)
+    if [[ "$prefix" == "$base_prefix" ]]; then
+      suggested_ip="$ip"
+      break
+    fi
+  done
+
+  exec 3>&1
+  user_ip=$(dialog --inputbox "PTR target IP address:" 8 50 "$suggested_ip" 2>&1 1>&3)
+  exec 3>&-
+  [ -z "$user_ip" ] && return
+
+  last=${user_ip##*.}
 
   cat > "$ZONE_DIR/db.$rev" <<EOF
 \$TTL 86400
@@ -538,6 +571,60 @@ EOF
 
   dialog --msgbox "Reverse zone '$full' created and applied." 6 50
 }
+
+delete_reverse_zone() {
+  mapfile -t zones < <(awk '
+    /zone "/ { zone=$2; gsub(/"/, "", zone); }
+    /type[[:space:]]+master/ && zone ~ /\.in-addr\.arpa$/ { print zone }
+  ' "$NAMED_CONF" | sed '/^\s*$/d')
+
+  if [ ${#zones[@]} -eq 0 ]; then
+    dialog --msgbox "No reverse zones found to delete." 6 40
+    return 1
+  fi
+
+  if [ ${#zones[@]} -eq 1 ]; then
+    selected_zone="${zones[0]}"
+    dialog --yesno "Only one reverse zone:\n\n$selected_zone\n\nDelete it?" 10 60
+    del_rc=$?
+    if [ $del_rc -ne 0 ]; then
+      return 1
+    fi
+  else
+    menu_args=()
+    for z in "${zones[@]}"; do menu_args+=( "$z" "$z" ); done
+    menu_height=$(( ${#zones[@]} > 10 ? 10 : ${#zones[@]} ))
+    [ "$menu_height" -lt 4 ] && menu_height=4
+
+    exec 3>&1
+    selected_zone=$(dialog --clear --title "Delete Reverse Zone" --menu "Select a reverse zone to delete:" 15 60 "$menu_height" "${menu_args[@]}" 2>&1 1>&3)
+    rc=$?; exec 3>&-
+    [ $rc -ne 0 ] || [ -z "$selected_zone" ] && return 1
+
+    dialog --yesno "Are you sure you want to delete reverse zone '$selected_zone'?" 7 50
+    del_rc=$?
+    if [ $del_rc -ne 0 ]; then
+      return 1
+    fi
+  fi
+
+  rndc freeze "$selected_zone" || true
+
+  awk -v zone="$selected_zone" '
+    $0 ~ "zone \"" zone "\"" { skip=1; next }
+    skip && /^};/ { skip=0; next }
+    skip { next }
+    { print }
+  ' "$NAMED_CONF" > "$STAGING_DIR/named.conf"
+  mv "$STAGING_DIR/named.conf" "$NAMED_CONF"
+  rm -f "$ZONE_DIR/db.${selected_zone%.in-addr.arpa}"
+  finalize_file "$NAMED_CONF"
+  systemctl reload named || rndc reload || true
+  rndc thaw "$selected_zone" || true
+
+  dialog --msgbox "Reverse zone '$selected_zone' deleted and BIND reloaded." 6 50
+}
+
 delete_reverse_zone() {
   mapfile -t zones < <(awk '
     /zone "/ { zone=$2; gsub(/"/, "", zone); }
