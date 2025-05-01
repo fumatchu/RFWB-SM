@@ -33,6 +33,22 @@ log_action() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
+# Validate MAC address format
+validate_mac() {
+  [[ "$1" =~ ^([a-fA-F0-9]{2}:){5}[a-fA-F0-9]{2}$ ]]
+}
+
+# Validate IPv4 address format
+validate_ip() {
+  local ip=$1
+  local stat=1
+  if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    OIFS=$IFS; IFS='.'; ip=($ip); IFS=$OIFS
+    [[ ${ip[0]} -le 255 && ${ip[1]} -le 255 && ${ip[2]} -le 255 && ${ip[3]} -le 255 ]]
+    stat=$?
+  fi
+  return $stat
+}
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 NAMED_CONF="/etc/named.conf"
@@ -85,6 +101,106 @@ ip_to_hex() {
 
 
 # ─── Structured Record Manager ───────────────────────────────────────────────
+  
+  add_mac_reservation_dialog() {
+  log_action "[DEBUG] Starting MAC reservation function"
+
+  exec 3>&1
+  mac=$(dialog --inputbox "Enter MAC address (e.g., 00:11:22:33:44:55):" 8 50 2>&1 1>&3)
+  [[ -z "$mac" ]] && log_action "[DEBUG] MAC entry cancelled or failed" && return
+  if ! validate_mac "$mac"; then
+    dialog --msgbox "Invalid MAC address format." 6 50
+    return
+  fi
+
+  ip=$(dialog --inputbox "Enter IP address to reserve for this MAC:" 8 50 2>&1 1>&3)
+  [[ -z "$ip" ]] && log_action "[DEBUG] IP entry cancelled or failed" && return
+  if ! validate_ip "$ip"; then
+    dialog --msgbox "Invalid IP address format." 6 50
+    return
+  fi
+
+  hostname=$(dialog --inputbox "Enter hostname (optional):" 8 50 2>&1 1>&3)
+  exec 3>&-
+  log_action "[DEBUG] Collected MAC: $mac, IP: $ip, Hostname: $hostname"
+
+  # Check for duplicate MAC or IP
+  if jq -e --arg mac "$mac" '.Dhcp4.subnet4[].reservations[]? | select(."hw-address" == $mac)' "$CONFIG_FILE" >/dev/null; then
+    dialog --msgbox "[ERROR] MAC address $mac is already reserved." 6 60
+    log_action "[ERROR] Duplicate MAC: $mac"
+    return
+  fi
+
+  if jq -e --arg ip "$ip" '.Dhcp4.subnet4[].reservations[]? | select(."ip-address" == $ip)' "$CONFIG_FILE" >/dev/null; then
+    dialog --msgbox "[ERROR] IP address $ip is already reserved." 6 60
+    log_action "[ERROR] Duplicate IP: $ip"
+    return
+  fi
+
+  ip_to_int() {
+    local a b c d
+    IFS=. read -r a b c d <<< "$1"
+    echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
+  }
+
+  ip_int=$(ip_to_int "$ip")
+  subnet_index=""
+
+  mapfile -t entries < <(jq -c '.Dhcp4.subnet4[]' "$CONFIG_FILE")
+  for i in "${!entries[@]}"; do
+    cidr=$(jq -r '.subnet' <<< "${entries[$i]}")
+    [[ "$cidr" == "null" ]] && continue
+
+    subnet_ip="${cidr%/*}"
+    prefix="${cidr#*/}"
+    mask=$(( 0xFFFFFFFF << (32 - prefix) & 0xFFFFFFFF ))
+
+    subnet_int=$(ip_to_int "$subnet_ip")
+    if (( (ip_int & mask) == (subnet_int & mask) )); then
+      subnet_index="$i"
+      break
+    fi
+  done
+
+  if [[ -z "$subnet_index" ]]; then
+    dialog --msgbox "[ERROR] Could not find matching subnet for IP $ip" 6 60
+    log_action "[ERROR] No matching subnet for $ip"
+    return
+  fi
+
+  log_action "[DEBUG] Subnet index matched: $subnet_index"
+
+  tmpfile=$(mktemp)
+  jq --arg mac "$mac" \
+     --arg ip "$ip" \
+     --arg hostname "$hostname" \
+     --argjson idx "$subnet_index" \
+     'if (.Dhcp4.subnet4[$idx].reservations) then
+        (.Dhcp4.subnet4[$idx].reservations) += [{"hw-address": $mac, "ip-address": $ip, "hostname": $hostname}]
+      else
+        .Dhcp4.subnet4[$idx].reservations = [{"hw-address": $mac, "ip-address": $ip, "hostname": $hostname}]
+      end' \
+     "$CONFIG_FILE" > "$tmpfile" 2>>"$LOG_FILE"
+
+  if [[ $? -ne 0 ]]; then
+    dialog --msgbox "[ERROR] Failed to update configuration." 6 60
+    log_action "[ERROR] jq failed to insert reservation"
+    rm -f "$tmpfile"
+    return
+  fi
+
+  mv "$tmpfile" "$CONFIG_FILE"
+  chown kea:kea "$CONFIG_FILE"
+  chmod 640 "$CONFIG_FILE"
+  restorecon "$CONFIG_FILE"
+
+  log_action "[DEBUG] Reservation added to subnet $subnet_index"
+  systemctl restart kea-dhcp4
+  log_action "[INFO] Reservation for $mac -> $ip added and service restarted"
+  dialog --msgbox "Reservation added and KEA restarted." 6 60
+}
+  
+  
   add_subnet () {
   CONFIG_FILE="/etc/kea/kea-dhcp4.conf"
   DDNS_FILE="/etc/kea/kea-dhcp-ddns.conf"
