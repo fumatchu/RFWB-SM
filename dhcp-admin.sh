@@ -21,6 +21,8 @@ yesno_box() {
 }
 #================== CONFIG ==================#
 CONFIG_FILE="/etc/kea/kea-dhcp4.conf"
+LEASES_FILE="/var/lib/kea/kea-leases4.csv"
+RESERVATIONS_FILE="/etc/kea/reservations.json"
 LOG_FILE="/var/log/kea-admin.log"
 SERVICE_NAME="kea-dhcp4"
 
@@ -99,10 +101,33 @@ ip_to_hex() {
   printf '%02x%02x%02x%02x' "$a" "$b" "$c" "$d"
 }
 
+# List active leases with optional search
+list_active_leases() {
+  if [[ ! -f "$LEASES_FILE" ]]; then
+    dialog --msgbox "Lease file not found: $LEASES_FILE" 6 50
+    return
+  fi
 
-# ─── Structured Record Manager ───────────────────────────────────────────────
-  
-  add_mac_reservation_dialog() {
+  exec 3>&1
+  search_term=$(dialog --inputbox "Enter MAC, IP, or hostname to filter (blank = all):" 8 60 "" 2>&1 1>&3)
+  exec 3>&-
+
+  tmp_output=$(mktemp)
+  {
+    printf "%-20s %-17s %-15s %-10s\n" "Lease Time" "MAC Address" "IP Address" "Hostname"
+    printf -- "%.0s-" {1..80}; echo
+    awk -F, -v search="$search_term" 'BEGIN {IGNORECASE=1}
+      NR > 1 && (search == "" || $1 ~ search || $2 ~ search || $9 ~ search) {
+        printf "%-20s %-17s %-15s %-10s\n", $5, $2, $1, $9
+      }
+    ' "$LEASES_FILE" | sort
+  } > "$tmp_output"
+
+  dialog --title "Active DHCP Leases" --textbox "$tmp_output" 35 110
+  rm -f "$tmp_output"
+}
+
+add_mac_reservation() {
   log_action "[DEBUG] Starting MAC reservation function"
 
   exec 3>&1
@@ -199,8 +224,65 @@ ip_to_hex() {
   log_action "[INFO] Reservation for $mac -> $ip added and service restarted"
   dialog --msgbox "Reservation added and KEA restarted." 6 60
 }
-  
-  
+# Delete static MAC reservation
+delete_mac_reservation() {
+  CONFIG_FILE="/etc/kea/kea-dhcp4.conf"
+  TMP_FILE="/tmp/kea-dhcp4.reservations.json"
+
+  mapfile -t RES_LIST < <(
+    jq -r '
+      .Dhcp4.subnet4[] |
+      select(.reservations != null and (.reservations | length > 0)) |
+      .id as $sid | .comment as $desc |
+      .reservations[] |
+      "\($sid)|\($desc)|\(."hw-address")|\(."ip-address")|\(.hostname // "")"
+    ' "$CONFIG_FILE"
+  )
+
+  if [[ ${#RES_LIST[@]} -eq 0 ]]; then
+    dialog --msgbox "No static reservations found." 6 50
+    return
+  fi
+
+  MENU=()
+  for entry in "${RES_LIST[@]}"; do
+    IFS="|" read -r sid desc mac ip host <<< "$entry"
+    label="$mac → $ip"
+    [[ -n "$host" ]] && label+=" ($host)"
+    [[ -n "$desc" ]] && label+=" - $desc"
+    MENU+=("${mac}|${sid}" "$label")
+  done
+
+  exec 3>&1
+  sel=$(dialog --clear --title "Delete MAC Reservation" \
+               --menu "Select a reservation to delete:" 20 80 12 \
+               "${MENU[@]}" 2>&1 1>&3)
+  exec 3>&-
+  [[ -z "$sel" ]] && return
+
+  mac="${sel%%|*}"
+  sid="${sel##*|}"
+
+  dialog --yesno "Are you sure you want to delete the reservation for $mac from subnet ID $sid?" 7 60 || return
+
+  jq --arg mac "$mac" --arg sid "$sid" '
+    .Dhcp4.subnet4 |= map(
+      if (.id == ($sid | tonumber)) then
+        .reservations |= map(select(."hw-address" != $mac))
+      else . end
+    )' "$CONFIG_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$CONFIG_FILE"
+
+  chown kea:kea "$CONFIG_FILE"
+  chmod 640 "$CONFIG_FILE"
+  restorecon "$CONFIG_FILE"
+
+  systemctl restart kea-dhcp4
+  dialog --msgbox "Reservation for $mac deleted from subnet ID $sid." 6 60
+}
+
+
+
+# ─── Structured Record Manager ───────────────────────────────────────────────
   add_subnet () {
   CONFIG_FILE="/etc/kea/kea-dhcp4.conf"
   DDNS_FILE="/etc/kea/kea-dhcp-ddns.conf"
@@ -726,32 +808,39 @@ kea_service_menu() {
   done
 }
 
+
 #================== MAIN MENU ==================#
 main_menu() {
   while true; do
     exec 3>&1
     CHOICE=$(dialog --clear --backtitle "KEA DHCP Admin Tool" \
       --title "Main Menu" \
-      --menu "Choose an option:" 15 60 6 \
+      --menu "Choose an option:" 18 60 9 \
       1 "Add Subnet" \
       2 "Delete Subnet" \
       3 "Edit kea-dhcp4.conf manually" \
-      4 "KEA Service Control" \
-      5 "Exit" \
+      4 "List Active Leases" \
+      5 "Add MAC Reservation" \
+      6 "Delete MAC Reservation" \
+      7 "KEA Service Control" \
+      8 "Exit" \
       2>&1 1>&3)
     menu_exit=$?
     exec 3>&-
 
     if [ $menu_exit -ne 0 ]; then
-      break  # Cancel or ESC was pressed
+      break
     fi
 
     case "$CHOICE" in
       1) add_subnet ;;
       2) delete_subnet ;;
       3) edit_config ;;
-      4) kea_service_menu ;;
-      5) break ;;
+      4) list_active_leases ;;
+      5) add_mac_reservation ;;
+      6) delete_mac_reservation ;;
+      7) kea_service_menu ;;
+      8) break ;;
     esac
   done
 }
