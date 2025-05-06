@@ -17,6 +17,8 @@ declare -A MODULE_SCRIPTS=(
   [Suricata]="/root/.rfwb-admin/suricata-admin.sh"
   [RFWB-PORTSCAN]="/root/.rfwb-admin/rfwb-portscan-admin.sh"
   [NFT-Threatlist]="/root/.rfwb-admin/nft-threat-admin.sh"
+  [SERVICES]="/root/.rfwb-admin/service-admin.sh"
+
 )
 
 declare -A MODULE_DESCRIPTIONS=(
@@ -26,6 +28,8 @@ declare -A MODULE_DESCRIPTIONS=(
   [Suricata]="Inspect Suricata IDS config"
   [RFWB-PORTSCAN]="Portscan detection for nftables"
   [NFT-Threatlist]="Threatlist updates for nftables"
+  [SERVICES]="Check system service statuses"
+
 )
 
 #========[ MODULE HANDLER ]========#
@@ -56,6 +60,11 @@ build_main_menu() {
       menu+=( "$module" "${MODULE_DESCRIPTIONS[$module]}" )
     fi
   done
+
+  # Always add static SERVICES module
+  if [[ -f "${MODULE_SCRIPTS[SERVICES]}" ]]; then
+    menu+=( "SERVICES" "${MODULE_DESCRIPTIONS[SERVICES]}" )
+  fi
 
   menu+=(
     "UPDATES" "Check for Updates"
