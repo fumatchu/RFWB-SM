@@ -574,9 +574,22 @@ EOF
 
 delete_reverse_zone() {
   mapfile -t zones < <(awk '
-    /zone "/ { zone=$2; gsub(/"/, "", zone); }
-    /type[[:space:]]+master/ && zone ~ /\.in-addr\.arpa$/ { print zone }
-  ' "$NAMED_CONF" | sed '/^\s*$/d')
+  BEGIN { zone=""; inside=0; }
+  /zone "/ {
+    match($0, /zone[[:space:]]+"([^"]+)"/, m);
+    zone = m[1];
+    inside = 1;
+    next;
+  }
+  inside && /type[[:space:]]+master/ && zone ~ /\.in-addr\.arpa$/ {
+    print zone;
+    inside = 0;
+    next;
+  }
+  inside && /^};/ {
+    inside = 0;
+  }
+' "$NAMED_CONF")
 
   if [ ${#zones[@]} -eq 0 ]; then
     dialog --msgbox "No reverse zones found to delete." 6 40
