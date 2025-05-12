@@ -289,7 +289,7 @@ case "$mode" in
 
     nmcli connection add type vlan con-name guest dev "$parent" id "$vid" ip4 "$vip"
     nmcli connection up guest
-    guest_iface="${parent}.${vid}"
+    guest_iface="$(echo "${parent}.${vid}" | xargs)"
     dns_ip=$(nmcli -g IP4.ADDRESS device show "$guest_iface" | awk -F/ '{print $1}')
     ;;
   *)
