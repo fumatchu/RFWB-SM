@@ -1,4 +1,3 @@
-GUEST SETUP VLAN
 #!/usr/bin/env bash
 #
 # guest_vlan_setup.sh
@@ -6,8 +5,7 @@ GUEST SETUP VLAN
 # Dialog‑driven setup/reset for a “Guest” interface + nftables lockdown:
 #  • On existing guest iface, optionally reset (cleanup old rules & conns)
 #  • Create new guest (physical or VLAN)
-#  • Allow ONLY DHCP, DNS, NTP on INPUT, and guest→outside in FORWARD,
-#    each inserted just below the matching ct/threat rules.
+#  • Allow ONLY DHCP, DNS, NTP on INPUT, and guest→outside in FORWARD
 # ──────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -23,22 +21,23 @@ backup_nft(){
   cp "$CONFIG" "$BACKUP_FILE"
 }
 
-# Get handle of the threat_block drop in INPUT
 get_input_handle(){
   nft --handle list chain inet filter input \
     | sed -n 's/.*ip saddr @threat_block drop.*# handle \([0-9]\+\).*/\1/p'
 }
 
-# NEW: Get handle of the established,related accept in INPUT
 get_input_est_handle(){
   nft --handle list chain inet filter input \
     | sed -n 's/.*ct state established,related accept.*# handle \([0-9]\+\).*/\1/p'
 }
 
-# Get handle of the established,related accept in FORWARD
 get_forward_handle(){
   nft --handle list chain inet filter forward \
     | sed -n 's/.*ct state established,related accept.*# handle \([0-9]\+\).*/\1/p'
+}
+get_input_logdrop_handle(){
+  nft --handle list chain inet filter input \
+    | sed -n 's/.*log prefix "INPUT DROP: " drop.*# handle \([0-9]\+\).*/\1/p'
 }
 
 #── 0) DETECT & OPTIONALLY RESET EXISTING GUEST ------------------------------
@@ -65,7 +64,6 @@ if [[ -n "$exist_phys" || -n "$exist_vlan" ]]; then
   if [[ $? -eq 0 ]]; then
     backup_nft
 
-    # Remove all INPUT rules for this guest_iface
     mapfile -t IN_HANDLES < <(
       nft --handle list chain inet filter input \
         | grep "iifname \"$guest_iface\"" \
@@ -75,7 +73,6 @@ if [[ -n "$exist_phys" || -n "$exist_vlan" ]]; then
       nft delete rule inet filter input handle "$h" 2>/dev/null || :
     done
 
-    # Remove all FORWARD rules for guest_iface → outside
     outside_if=$(nmcli -t -f DEVICE,NAME connection show --active 2>/dev/null \
       | awk -F: '$2 ~ /-outside$/ {print $1; exit}')
     if [[ -n "$outside_if" ]]; then
@@ -89,7 +86,6 @@ if [[ -n "$exist_phys" || -n "$exist_vlan" ]]; then
       done
     fi
 
-    # Clean up the old connection profile
     if [[ -n "$exist_phys" ]]; then
       orig=${guest_profile%-guest}
       nmcli connection modify "$guest_profile" connection.id "$orig"
@@ -113,29 +109,52 @@ dialog --clear --title "Guest VLAN Setup" \
 mode=$(< /tmp/_mode); rm -f /tmp/_mode
 
 case "$mode" in
-  1)  # Physical
-    dialog --msgbox "Unplug your spare port, click OK, then plug it in." 8 50
-    mapfile -t OLD < <(
-      nmcli -t -f DEVICE,STATE device status \
-        | awk -F: '$2=="connected"{print $1}'
-    )
-    dialog --infobox "Waiting for guest port…" 5 50
-    while :; do
-      mapfile -t NOW < <(
-        nmcli -t -f DEVICE,STATE device status \
-          | awk -F: '$2=="connected"{print $1}'
-      )
-      for i in "${NOW[@]}"; do
-        [[ ! " ${OLD[*]} " =~ " $i " ]] && { guest_iface="$i"; break 2; }
-      done
-      sleep .5
-    done
-    dialog --infobox "Detected: $guest_iface" 6 50; sleep 1
-    prof=$(nmcli -t -f NAME,DEVICE connection show 2>/dev/null \
-      | awk -F: -v d="$guest_iface" '$2==d{print $1}')
-    nmcli connection modify "$prof" connection.id "${prof}-guest"
-    nmcli connection up "${prof}-guest"
-    ;;
+  1)  # Improved physical port detection
+      dialog --msgbox "Unplug your spare port, click OK, then plug it in." 8 50
+
+# Store interfaces that currently have carrier
+mapfile -t OLD_CARRIER < <(find /sys/class/net -maxdepth 1 -type l \
+  | grep -vE '/lo$' \
+  | while read -r dev; do
+      iface=$(basename "$dev")
+      [[ "$(cat "$dev/carrier")" == "1" ]] && echo "$iface"
+    done)
+
+dialog --infobox "Waiting for a new link to show carrier…" 5 50
+
+for attempt in {1..20}; do
+  sleep 1
+  mapfile -t NEW_CARRIER < <(find /sys/class/net -maxdepth 1 -type l \
+    | grep -vE '/lo$' \
+    | while read -r dev; do
+        iface=$(basename "$dev")
+        [[ "$(cat "$dev/carrier")" == "1" ]] && echo "$iface"
+      done)
+
+  for i in "${NEW_CARRIER[@]}"; do
+    [[ ! " ${OLD_CARRIER[*]} " =~ " $i " ]] && { guest_iface="$i"; break 2; }
+  done
+done
+
+if [[ -z "${guest_iface:-}" ]]; then
+  dialog --msgbox "⚠️ No new physical link detected within timeout." 6 60
+  exit 1
+fi
+
+dialog --infobox "Detected new physical link: $guest_iface" 6 50; sleep 1
+
+# Now try to find any connection profile and apply guest tag
+prof=$(nmcli -t -f NAME,DEVICE connection show 2>/dev/null \
+  | awk -F: -v d="$guest_iface" '$2==d{print $1}')
+if [[ -n "$prof" ]]; then
+  nmcli connection modify "$prof" connection.id "${prof}-guest"
+  nmcli connection up "${prof}-guest"
+else
+  # No profile exists — create one
+  nmcli connection add type ethernet ifname "$guest_iface" con-name "${guest_iface}-guest"
+  nmcli connection up "${guest_iface}-guest"
+fi
+;;
   2)  # VLAN
     mapfile -t PHYS < <(
       nmcli -t -f DEVICE,TYPE device status \
@@ -172,17 +191,19 @@ outside_if=$(nmcli -t -f DEVICE,NAME connection show --active 2>/dev/null \
 
 backup_nft
 
-# INPUT chain: insert DHCP, DNS, and NTP rules *after* established,related accept
+drop_handle=$(get_input_logdrop_handle)
+
+drop_handle=$(get_input_logdrop_handle)
+
 for rule in \
   "iifname \"$guest_iface\" udp dport 67  accept" \
   "iifname \"$guest_iface\" udp dport 68  accept" \
   "iifname \"$guest_iface\" udp dport 53  accept" \
   "iifname \"$guest_iface\" tcp dport 53  accept" \
   "iifname \"$guest_iface\" udp dport 123 accept"; do
-  nft add rule inet filter input position "$(get_input_est_handle)" $rule
+  nft insert rule inet filter input handle "$drop_handle" $rule
 done
 
-# FORWARD chain: insert guest→outside *after* established,related accept
 fwd_rule="iifname \"$guest_iface\" oifname \"$outside_if\" ct state new accept"
 nft add rule inet filter forward position "$(get_forward_handle)" $fwd_rule
 
