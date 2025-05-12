@@ -27,7 +27,9 @@ remove_guest_interface_and_scope() {
 
   echo "Removing guest scope for interface: $iface ($cidr)"
 
-  # Remove firewall rules
+
+
+    # Remove firewall rules
   backup_nft
   mapfile -t IN_HANDLES < <(nft --handle list chain inet filter input | grep "iifname \"$iface\"" | awk '{print $NF}')
   for h in "${IN_HANDLES[@]}"; do nft delete rule inet filter input handle "$h" 2>/dev/null || :; done
@@ -36,10 +38,23 @@ remove_guest_interface_and_scope() {
   if [[ -n "$outside_if" ]]; then
     mapfile -t FW_HANDLES < <(nft --handle list chain inet filter forward | grep "iifname \"$iface\" oifname \"$outside_if\"" | awk '{print $NF}')
     for h in "${FW_HANDLES[@]}"; do nft delete rule inet filter forward handle "$h" 2>/dev/null || :; done
+
+    # Also remove from forward_internet chain
+    mapfile -t FWD_GUEST_HANDLES < <(
+      nft --handle list chain inet filter forward_internet \
+        | grep "ip saddr $cidr" | grep "iifname \"$iface\"" | grep "oifname \"$outside_if\"" \
+        | awk '{print $NF}'
+    )
+    for h in "${FWD_GUEST_HANDLES[@]}"; do
+      nft delete rule inet filter forward_internet handle "$h" 2>/dev/null || :
+    done
   fi
 
   # Delete the guest connection
   nmcli connection delete "$con_name" || :
+
+
+
 
   # Remove DHCP subnet
   tmpconf=$(mktemp)
