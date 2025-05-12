@@ -96,7 +96,7 @@ options=$(jq -n --arg r "$router_ip" --arg d "$iface_ip" --arg dom "$domain" '[
 
   # Reverse DNS zone
   rev_zone=$(echo "${cidr%.*}" | awk -F. '{print $3"."$2"."$1}')
-  zone_name="$rev_zone.in-addr.arpa."
+  zone_name="$rev_zone.in-addr.arpa"
   if ! jq -e --arg z "$zone_name" '.DhcpDdns["reverse-ddns"]["ddns-domains"][]? | select(.name == $z)' "$KEA_DDNS_CONFIG" >/dev/null; then
     tmpddns=$(mktemp)
     jq --arg z "$zone_name" '.DhcpDdns["reverse-ddns"]["ddns-domains"] += [{"name": $z, "key-name": "Kea-DDNS", "dns-servers": [{"ip-address": "127.0.0.1", "port": 53}]}]' "$KEA_DDNS_CONFIG" > "$tmpddns"
