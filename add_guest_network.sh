@@ -50,33 +50,33 @@ add_guest_subnet_to_kea() {
   iface_ip=$(nmcli -g IP4.ADDRESS device show "$iface" | awk -F/ '{print $1}')
 
   local base_net
-base_net=$(echo "$cidr" | cut -d/ -f1 | awk -F. '{printf "%s.%s.%s", $1, $2, $3}')
+  base_net=$(echo "$cidr" | cut -d/ -f1 | awk -F. '{printf "%s.%s.%s", $1, $2, $3}')
 
-local router_ip="$iface_ip"
-local pool_start="${base_net}.10"
-local pool_end="${base_net}.200"
-local desc="Guest Subnet ($cidr)"
+  local router_ip="$iface_ip"
+  local pool_start="${base_net}.10"
+  local pool_end="${base_net}.200"
+  local desc="Guest Subnet ($cidr)"
 
   local id
   id=$(jq '[.Dhcp4.subnet4[].id] | max + 1' "$KEA_CONFIG" 2>/dev/null || echo 1)
   [[ -z "$id" || "$id" == "null" ]] && id=1
 
   local fqdn
-fqdn=$(hostnamectl status | awk '/Static hostname:/ {print $3}')
+  fqdn=$(hostnamectl status | awk '/Static hostname:/ {print $3}')
 
-local options
-options=$(jq -n --arg r "$router_ip" --arg d "$iface_ip" --arg dom "$domain" '[
-  { "name": "routers", "data": $r },
-  { "name": "domain-name-servers", "data": $d },
-  { "name": "ntp-servers", "data": $d },
-  { "name": "domain-search", "data": $dom },
-  { "name": "domain-name", "data": $dom }
-]')
+  local options
+  options=$(jq -n --arg r "$router_ip" --arg d "$iface_ip" --arg dom "$domain" '[
+    { "name": "routers", "data": $r },
+    { "name": "domain-name-servers", "data": $d },
+    { "name": "ntp-servers", "data": $d },
+    { "name": "domain-search", "data": $dom },
+    { "name": "domain-name", "data": $dom }
+  ]')
 
   local subnet
   subnet=$(jq -n --argjson id "$id" --arg cidr "$cidr" --arg desc "$desc" \
                    --arg pool_start "$pool_start" --arg pool_end "$pool_end" \
-                   --arg iface "$iface" --argjson opts "$options" ' {
+                   --arg iface "$iface" --argjson opts "$options" '{
     id: $id,
     subnet: $cidr,
     comment: $desc,
@@ -85,6 +85,7 @@ options=$(jq -n --arg r "$router_ip" --arg d "$iface_ip" --arg dom "$domain" '[
     "option-data": $opts
   }')
 
+  # Write to kea-dhcp4.conf
   local tmpconf
   tmpconf=$(mktemp)
   jq --argjson sn "$subnet" '.Dhcp4.subnet4 += [$sn]' "$KEA_CONFIG" > "$tmpconf" && mv "$tmpconf" "$KEA_CONFIG"
@@ -94,36 +95,47 @@ options=$(jq -n --arg r "$router_ip" --arg d "$iface_ip" --arg dom "$domain" '[
 
   kea-dhcp4 -t "$KEA_CONFIG" || die "KEA config test failed"
 
-  # Reverse DNS zone
+  # Reverse DNS zone names
+  local rev_zone zone_name_ddns zone_name_bind
   rev_zone=$(echo "${cidr%.*}" | awk -F. '{print $3"."$2"."$1}')
-  zone_name="$rev_zone.in-addr.arpa."
-  if ! jq -e --arg z "$zone_name" '.DhcpDdns["reverse-ddns"]["ddns-domains"][]? | select(.name == $z)' "$KEA_DDNS_CONFIG" >/dev/null; then
+  zone_name_ddns="${rev_zone}.in-addr.arpa."   # For KEA
+  zone_name_bind="${rev_zone}.in-addr.arpa"    # For BIND
+
+  # Append to kea-dhcp-ddns.conf
+  if ! jq -e --arg z "$zone_name_ddns" '.DhcpDdns["reverse-ddns"]["ddns-domains"][]? | select(.name == $z)' "$KEA_DDNS_CONFIG" >/dev/null; then
     tmpddns=$(mktemp)
-    jq --arg z "$zone_name" '.DhcpDdns["reverse-ddns"]["ddns-domains"] += [{"name": $z, "key-name": "Kea-DDNS", "dns-servers": [{"ip-address": "127.0.0.1", "port": 53}]}]' "$KEA_DDNS_CONFIG" > "$tmpddns"
+    jq --arg z "$zone_name_ddns" '.DhcpDdns["reverse-ddns"]["ddns-domains"] += [{
+      "name": $z,
+      "key-name": "Kea-DDNS",
+      "dns-servers": [ { "ip-address": "127.0.0.1", "port": 53 } ]
+    }]' "$KEA_DDNS_CONFIG" > "$tmpddns"
     mv "$tmpddns" "$KEA_DDNS_CONFIG"
-    chown kea:kea "$KEA_DDNS_CONFIG"; chmod 640 "$KEA_DDNS_CONFIG"; restorecon "$KEA_DDNS_CONFIG"
+    chown kea:kea "$KEA_DDNS_CONFIG"
+    chmod 640 "$KEA_DDNS_CONFIG"
+    restorecon "$KEA_DDNS_CONFIG"
   fi
 
-  # BIND zone file
-  zone_file="$ZONE_DIR/db.${rev_zone}"
-last_octet=$(echo "$iface_ip" | awk -F. '{print $4}')
-fqdn=$(hostnamectl status | awk '/Static hostname:/ {print $3}')
+  # BIND reverse zone file
+  local zone_file="$ZONE_DIR/db.${rev_zone}"
+  local last_octet
+  last_octet=$(echo "$iface_ip" | awk -F. '{print $4}')
+  fqdn=$(hostnamectl status | awk '/Static hostname:/ {print $3}')
 
-# Ensure reverse zone is in named.conf
-if ! grep -q "zone \"$zone_name\"" "$NAMED_CONF"; then
-  cat >> "$NAMED_CONF" <<EOF
+  # Append to named.conf if not present
+  if ! grep -q "zone \"$zone_name_bind\"" "$NAMED_CONF"; then
+    cat >> "$NAMED_CONF" <<EOF
 
-zone "$zone_name" {
+zone "$zone_name_bind" {
   type master;
   file "$zone_file";
   allow-update { key "Kea-DDNS"; };
 };
 EOF
-fi
+  fi
 
-# Ensure reverse zone file exists
-if [[ ! -f "$zone_file" ]]; then
-  cat > "$zone_file" <<EOF
+  # Create reverse zone file if missing
+  if [[ ! -f "$zone_file" ]]; then
+    cat > "$zone_file" <<EOF
 \$TTL 86400
 @   IN  SOA   ${fqdn}. admin.${domain}. (
     $(date +%Y%m%d01) ; serial
@@ -134,11 +146,12 @@ if [[ ! -f "$zone_file" ]]; then
 @   IN  NS    ${fqdn}.
 $last_octet  IN PTR ${fqdn}.
 EOF
-  chown named:named "$zone_file"
-  chmod 640 "$zone_file"
-  restorecon "$zone_file"
-fi
+    chown named:named "$zone_file"
+    chmod 640 "$zone_file"
+    restorecon "$zone_file"
+  fi
 
+  # Restart services
   systemctl restart kea-dhcp4 kea-dhcp-ddns named
 }
 
