@@ -315,7 +315,6 @@ for rule in \
   "iifname \"$guest_iface\" udp dport 67  accept" \
   "iifname \"$guest_iface\" udp dport 68  accept" \
   "iifname \"$guest_iface\" udp dport 53  accept" \
-  "iifname \"$guest_iface\" tcp dport 53  accept" \
   "iifname \"$guest_iface\" udp dport 123 accept"; do
   nft insert rule inet filter input handle "$drop_handle" $rule
 done
@@ -337,10 +336,8 @@ add_guest_subnet_to_kea "$subnet_cidr" "$guest_iface"  "$domain"
 
 dialog --msgbox \
   "Guest interface $guest_iface ready!\n\n\
-INPUT: DHCP(67,68), DNS(53), NTP(123) inserted below established,related accept\n\
-FORWARD: guest → outside inserted below established,related accept\n\n\
+INPUT: DHCP(UDP 67,UDP 68), DNS(UDP 53), NTP(UDP 123) inserted below established,related accept\n\
+FORWARD: guest → outside inserted to Internet Access Rule\n\n\
 Other traffic is dropped by policy." \
  12 75
 
-clear
-echo "Guest VLAN setup complete."
