@@ -336,8 +336,25 @@ add_guest_subnet_to_kea "$subnet_cidr" "$guest_iface"  "$domain"
 
 dialog --msgbox \
   "Guest interface $guest_iface ready!\n\n\
-INPUT: DHCP(UDP 67,UDP 68), DNS(UDP 53), NTP(UDP 123) inserted below established,related accept\n\
-FORWARD: guest → outside inserted to Internet Access Rule\n\n\
+INPUT: DHCP( UDP 67,68), DNS(UDP 53), NTP(UDP 123) inserted below established,related accept\n\
+FORWARD: guest → outside inserted for internet access\n\n\
 Other traffic is dropped by policy." \
  12 75
+#── 4) VALIDATE & SAVE NFTABLES RULESET -------------------------------------
 
+# Save current running rules to a temporary file for validation
+TMP_NFT=$(mktemp)
+nft list ruleset > "$TMP_NFT"
+
+if nft -c -f "$TMP_NFT" &>/dev/null; then
+  cp "$TMP_NFT" "$CONFIG"
+  chmod 600 "$CONFIG"
+  restorecon "$CONFIG"
+  dialog --msgbox "nftables ruleset saved to:\n$CONFIG\n\nValidation successful." 8 60
+else
+  dialog --msgbox "ERROR: Generated ruleset is invalid!\n\nReverting to backup." 8 60
+  cp "$BACKUP_FILE" "$CONFIG"
+  restorecon "$CONFIG"
+fi
+
+rm -f "$TMP_NFT"
