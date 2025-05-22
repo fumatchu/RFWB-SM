@@ -9,6 +9,34 @@ LOGFILE="/var/log/nft-threatlist.log"
 
 EDITOR="${EDITOR:-vi}"
 
+# ===== CLI Argument Parsing =====
+if [[ $# -gt 0 ]]; then
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --add-ip)
+        shift
+        NEW_IP="$1"
+        if [[ "$2" == "--v6" ]]; then
+          shift
+          echo "$NEW_IP" >> "$MANUAL_BLOCK_LIST_V6"
+          nft add element inet filter threat_block_v6 { $NEW_IP } 2>/dev/null
+          logger -t "$LOG_TAG" "Added $NEW_IP to threat_block_v6 (manual)"
+        else
+          echo "$NEW_IP" >> "$MANUAL_BLOCK_LIST"
+          nft add element inet filter threat_block { $NEW_IP } 2>/dev/null
+          logger -t "$LOG_TAG" "Added $NEW_IP to threat_block (manual)"
+        fi
+        echo "[SUCCESS] $NEW_IP added to threatlist."
+        exit 0
+        ;;
+      *)
+        echo "[ERROR] Unknown option: $1"
+        exit 1
+        ;;
+    esac
+  done
+fi
+
 # ===== Dialog Helpers =====
 msg_box() { dialog --title "$1" --msgbox "$2" 8 60; }
 input_box() {
