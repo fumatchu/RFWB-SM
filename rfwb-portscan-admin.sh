@@ -1,9 +1,10 @@
 #!/bin/bash
 
-CONF_FILE="/etc/rfwb-portscan.conf"
+CONF_FILE="/etc/rfwb/portscan.conf"
 IGNORE_NETWORKS_FILE="/etc/nftables/ignore_networks.conf"
 IGNORE_PORTS_FILE="/etc/nftables/ignore_ports.conf"
 LOG_FILE="/var/log/rfwb-portscan.log"
+THREATLIST_ADMIN="/usr/local/bin/nft-threatlist-admin.sh"
 
 EDITOR="${EDITOR:-vi}"
 
@@ -35,50 +36,72 @@ edit_file() {
 # ===== View Blocked IPs =====
 view_blocked_ips() {
   tmp=$(mktemp)
-  nft list set inet scanblock threatlist > "$tmp" 2>/dev/null || echo "Set not found." > "$tmp"
+  {
+    echo "IPv4 Blocked:"
+    nft list set inet portscan dynamic_block 2>/dev/null || echo "(none)"
+    echo ""
+    echo "IPv6 Blocked:"
+    nft list set inet portscan dynamic_block_v6 2>/dev/null || echo "(none)"
+  } > "$tmp"
   dialog --title "Blocked IPs" --textbox "$tmp" 25 80
   rm -f "$tmp"
 }
 
-# ===== Manual IP Management =====
-manual_add_ip() {
-  ip=$(dialog --inputbox "Enter IP to block manually:" 8 50 2>&1 >/dev/tty)
-  [[ -z "$ip" ]] && return
-  nft add element inet scanblock threatlist { $ip } && \
-  msg_box "Success" "$ip added to blocklist."
-}
+# ===== Promote to nft-threatlist =====
+promote_blocked_to_threatlist() {
+  tmp=$(mktemp)
+  {
+    echo "# IPv4"
+    nft list set inet portscan dynamic_block 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+'
+    echo "# IPv6"
+    nft list set inet portscan dynamic_block_v6 2>/dev/null | grep -oP '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+'
+  } | sort -u | grep -v '^#' > "$tmp"
 
-manual_remove_ip() {
-  ip=$(dialog --inputbox "Enter IP to remove from blocklist:" 8 50 2>&1 >/dev/tty)
-  [[ -z "$ip" ]] && return
-  nft delete element inet scanblock threatlist { $ip } && \
-  msg_box "Success" "$ip removed from blocklist."
+  if [[ ! -s "$tmp" ]]; then
+    msg_box "No IPs" "No dynamically blocked IPs found."
+    rm -f "$tmp"
+    return
+  fi
+
+  checklist=$(mktemp)
+  while read -r ip; do
+    echo "$ip" "" off
+  done < "$tmp" > "$checklist"
+
+  mapfile -t selected < <(dialog --separate-output --checklist "Select IPs to promote to nft-threatlist:" 25 70 20 \
+    --file "$checklist" 3>&1 1>&2 2>&3)
+
+  [[ ${#selected[@]} -eq 0 ]] && rm -f "$tmp" "$checklist" && return
+
+  for ip in "${selected[@]}"; do
+    if [[ $ip == *:* ]]; then
+      "$THREATLIST_ADMIN" --add-ip "$ip" --v6
+    else
+      "$THREATLIST_ADMIN" --add-ip "$ip"
+    fi
+  done
+
+  msg_box "Success" "Selected IPs promoted to threatlist."
+  rm -f "$tmp" "$checklist"
 }
 
 # ===== View Logs =====
 view_logs() {
-  if grep -q "Port Scan Detected" /var/log/messages; then
-    grep "Port Scan Detected" /var/log/messages | tail -n 500 > /tmp/scanlog
-    dialog --title "Port Scan Detections" --textbox /tmp/scanlog 25 100
-    rm -f /tmp/scanlog
-  else
-    msg_box "No Logs" "No 'Port Scan Detected' entries found in /var/log/messages."
-  fi
+  tmp=$(mktemp)
+  journalctl -u rfwb-portscan -n 500 --no-pager > "$tmp" || echo "No logs found." > "$tmp"
+  dialog --title "rfwb-portscan Logs" --textbox "$tmp" 25 100
+  rm -f "$tmp"
 }
 
 # ===== Service Control =====
 service_control() {
   while true; do
-    choice=$(dialog --title "Service Control" --menu "Choose action:" 15 60 6 \
+    choice=$(dialog --title "Service Control" --menu "Choose action:" 15 60 5 \
       1 "Start rfwb-portscan" \
       2 "Stop rfwb-portscan" \
       3 "Restart rfwb-portscan" \
       4 "Status rfwb-portscan" \
-      5 "Start rfwb-ps-mon" \
-      6 "Stop rfwb-ps-mon" \
-      7 "Restart rfwb-ps-mon" \
-      8 "Status rfwb-ps-mon" \
-      9 "Back" \
+      5 "Back" \
       3>&1 1>&2 2>&3)
 
     case $choice in
@@ -86,41 +109,34 @@ service_control() {
       2) systemctl stop rfwb-portscan && msg_box "Stopped" "rfwb-portscan stopped." ;;
       3) systemctl restart rfwb-portscan && msg_box "Restarted" "rfwb-portscan restarted." ;;
       4) systemctl status rfwb-portscan | tee /tmp/status && dialog --textbox /tmp/status 20 70 ;;
-      5) systemctl start rfwb-ps-mon && msg_box "Started" "rfwb-ps-mon started." ;;
-      6) systemctl stop rfwb-ps-mon && msg_box "Stopped" "rfwb-ps-mon stopped." ;;
-      7) systemctl restart rfwb-ps-mon && msg_box "Restarted" "rfwb-ps-mon restarted." ;;
-      8) systemctl status rfwb-ps-mon | tee /tmp/status && dialog --textbox /tmp/status 20 70 ;;
-      9|*) break ;;
+      5|*) break ;;
     esac
   done
 }
 
-
 # ===== Main Menu =====
 main_menu() {
   while true; do
-    choice=$(dialog --clear --title "rfwb-portscan Admin" --menu "Choose an option:" 20 60 10 \
-      1 "View Blocked IPs" \
-      2 "Manually Add IP" \
-      3 "Manually Remove IP" \
-      4 "Edit Detection Settings" \
-      5 "Edit Ignore Networks" \
-      6 "Edit Ignore Ports" \
-      7 "View Logs" \
-      8 "Service Control" \
-      9 "Exit" \
+    choice=$(dialog --clear --title "rfwb-portscan Admin" --menu "Choose an option:" 25 60 10 \
+      1 "View Blocked IPs (v4/v6)" \
+      2 "Promote Blocked IPs to Threatlist" \
+      3 "Edit Detection Settings" \
+      4 "Edit Ignore Networks" \
+      5 "Edit Ignore Ports" \
+      6 "View Logs" \
+      7 "Service Control" \
+      8 "Exit" \
       3>&1 1>&2 2>&3)
 
     case $choice in
       1) view_blocked_ips ;;
-      2) manual_add_ip ;;
-      3) manual_remove_ip ;;
-      4) edit_file "$CONF_FILE" ;;
-      5) edit_file "$IGNORE_NETWORKS_FILE" ;;
-      6) edit_file "$IGNORE_PORTS_FILE" ;;
-      7) view_logs ;;
-      8) service_control ;;
-      9 |*) clear; exit 0 ;;
+      2) promote_blocked_to_threatlist ;;
+      3) edit_file "$CONF_FILE" ;;
+      4) edit_file "$IGNORE_NETWORKS_FILE" ;;
+      5) edit_file "$IGNORE_PORTS_FILE" ;;
+      6) view_logs ;;
+      7) service_control ;;
+      8|*) clear; exit 0 ;;
     esac
   done
 }
