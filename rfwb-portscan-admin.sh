@@ -9,7 +9,7 @@ THREATLIST_ADMIN="/usr/local/bin/nft-threatlist-admin.sh"
 EDITOR="${EDITOR:-vi}"
 
 # ===== Dialog Helpers =====
-msg_box() { dialog --title "$1" --msgbox "$2" 8 60; }
+msg_box() { dialog --title "$1" --msgbox "$2" 10 70; }
 
 edit_file() {
   tmp=$(mktemp)
@@ -31,6 +31,60 @@ edit_file() {
   fi
 
   rm -f "$tmp" "$out"
+}
+
+# ===== CIDR-safe Edit for Ignore Networks (IPv4 + IPv6) =====
+edit_ignore_networks_safe() {
+  tmp=$(mktemp)
+  cp "$IGNORE_NETWORKS_FILE" "$tmp"
+  out=$(mktemp)
+  cleaned=$(mktemp)
+
+  dialog --title "Editing ignore_networks.conf" --editbox "$tmp" 25 80 2>"$out"
+  rc=$?
+
+  if [[ $rc -ne 0 ]]; then
+    msg_box "Cancelled" "Edit cancelled. No changes were made."
+    rm -f "$tmp" "$out" "$cleaned"
+    return
+  fi
+
+  # Step 1: Clean input
+  awk 'NF' "$out" | sed 's/ *, */,/g' | sed 's/^,*//' | sed 's/,*$//' > "$cleaned"
+
+  # Step 2: Validate using system routing logic
+  invalid=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+
+    if [[ "$line" == *:* ]]; then
+      ip -6 route get "$line" &>/dev/null || invalid+=("$line")
+    else
+      ip -4 route get "$line" &>/dev/null || invalid+=("$line")
+    fi
+  done < "$cleaned"
+
+  if (( ${#invalid[@]} > 0 )); then
+    err_list=$(printf "%s\n" "${invalid[@]}")
+    msg_box "Invalid Entries" "The following lines are not valid IPv4/IPv6 CIDRs:\n\n$err_list"
+    rm -f "$tmp" "$out" "$cleaned"
+    return
+  fi
+
+  # Step 3: Save and restart
+  if ! cmp -s "$IGNORE_NETWORKS_FILE" "$cleaned"; then
+    cp "$cleaned" "$IGNORE_NETWORKS_FILE"
+    systemctl restart rfwb-portscan && sleep 1
+    if systemctl is-active --quiet rfwb-portscan; then
+      msg_box "Updated" "ignore_networks.conf updated.\n\n[SUCCESS] rfwb-portscan is running."
+    else
+      msg_box "Error" "File saved, but rfwb-portscan failed to restart.\nCheck:\n  journalctl -u rfwb-portscan"
+    fi
+  else
+    msg_box "No Changes" "No changes were made."
+  fi
+
+  rm -f "$tmp" "$out" "$cleaned"
 }
 
 # ===== View Blocked IPs =====
@@ -132,7 +186,7 @@ main_menu() {
       1) view_blocked_ips ;;
       2) promote_blocked_to_threatlist ;;
       3) edit_file "$CONF_FILE" ;;
-      4) edit_file "$IGNORE_NETWORKS_FILE" ;;
+      4) edit_ignore_networks_safe ;;
       5) edit_file "$IGNORE_PORTS_FILE" ;;
       6) view_logs ;;
       7) service_control ;;
