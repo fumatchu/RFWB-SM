@@ -6,6 +6,8 @@ NFTABLES_TABLE="inet filter"
 NFTABLES_CHAIN="input"
 THREAT_FEEDS_FILE="/etc/nft-threatlist-feeds.txt"
 LOGFILE="/var/log/nft-threatlist.log"
+MANUAL_BLOCK_LIST="/etc/nft-threat-list/manual_block_list.txt"
+MANUAL_BLOCK_LIST_V6="/etc/nft-threat-list/manual_block_list_v6.txt"
 
 EDITOR="${EDITOR:-vi}"
 
@@ -16,17 +18,38 @@ if [[ $# -gt 0 ]]; then
       --add-ip)
         shift
         NEW_IP="$1"
-        if [[ "$2" == "--v6" ]]; then
-          shift
-          echo "$NEW_IP" >> "$MANUAL_BLOCK_LIST_V6"
-          nft add element inet filter threat_block_v6 { $NEW_IP } 2>/dev/null
-          logger -t "$LOG_TAG" "Added $NEW_IP to threat_block_v6 (manual)"
+        shift
+        if [[ "$1" == "--v6" ]]; then
+          # IPv6 handling
+          if ! grep -qxF "$NEW_IP" "$MANUAL_BLOCK_LIST_V6"; then
+            echo "$NEW_IP" >> "$MANUAL_BLOCK_LIST_V6"
+          else
+            echo "[INFO] $NEW_IP already in manual block list."
+          fi
+
+          if ! nft list set inet filter threat_block_v6 | grep -q "$NEW_IP"; then
+            nft add element inet filter threat_block_v6 { $NEW_IP } 2>/dev/null
+            logger -t "$LOG_TAG" "Added $NEW_IP to threat_block_v6 (manual)"
+            echo "[SUCCESS] $NEW_IP added to threatlist."
+          else
+            echo "[SKIPPED] $NEW_IP is already present in threat_block_v6 set."
+          fi
         else
-          echo "$NEW_IP" >> "$MANUAL_BLOCK_LIST"
-          nft add element inet filter threat_block { $NEW_IP } 2>/dev/null
-          logger -t "$LOG_TAG" "Added $NEW_IP to threat_block (manual)"
+          # IPv4 handling
+          if ! grep -qxF "$NEW_IP" "$MANUAL_BLOCK_LIST"; then
+            echo "$NEW_IP" >> "$MANUAL_BLOCK_LIST"
+          else
+            echo "[INFO] $NEW_IP already in manual block list."
+          fi
+
+          if ! nft list set inet filter threat_block | grep -q "$NEW_IP"; then
+            nft add element inet filter threat_block { $NEW_IP } 2>/dev/null
+            logger -t "$LOG_TAG" "Added $NEW_IP to threat_block (manual)"
+            echo "[SUCCESS] $NEW_IP added to threatlist."
+          else
+            echo "[SKIPPED] $NEW_IP is already present in threat_block set."
+          fi
         fi
-        echo "[SUCCESS] $NEW_IP added to threatlist."
         exit 0
         ;;
       *)
@@ -189,24 +212,30 @@ add_ip() {
     rm -f "$TEMP_INPUT"
   fi
 
-  # IP validation patterns
   local ipv4_regex='^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$'
   local ipv6_regex='^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8]))?$'
   local list_file="" nft_set="" timeout_arg=""
 
   if [[ "$ip" =~ $ipv4_regex ]]; then
-    list_file="/etc/nft-threat-list/manual_block_list.txt"
+    list_file="$MANUAL_BLOCK_LIST"
     nft_set="threat_block"
   elif [[ "$ip" =~ $ipv6_regex ]]; then
-    list_file="/etc/nft-threat-list/manual_block_list_v6.txt"
+    list_file="$MANUAL_BLOCK_LIST_V6"
     nft_set="threat_block_v6"
   else
     msg_box "Invalid IP" "'$ip' is not a valid IPv4 or IPv6 address (with optional CIDR)."
     return
   fi
 
-  if grep -q "^$ip$" "$list_file"; then
+  # Check for duplicate in list file
+  if grep -qxF "$ip" "$list_file"; then
     msg_box "Already Exists" "$ip is already in the manual block list."
+    return
+  fi
+
+  # Check if IP already exists in nft set
+  if nft list set inet filter "$nft_set" | grep -q "$ip"; then
+    msg_box "Already Blocked" "$ip is already in the nftables $nft_set set."
     return
   fi
 
@@ -246,16 +275,18 @@ remove_ip() {
     rm -f "$TEMP_INPUT"
   fi
 
-  if grep -q "^$ip$" /etc/nft-threat-list/manual_block_list.txt; then
-    grep -v "^$ip$" /etc/nft-threat-list/manual_block_list.txt > /tmp/filtered_blocklist && \
+  ip=$(echo "$ip" | xargs)  # Trim whitespace
+
+  if grep -qE "^\s*${ip}\s*$" /etc/nft-threat-list/manual_block_list.txt; then
+    grep -vE "^\s*${ip}\s*$" /etc/nft-threat-list/manual_block_list.txt > /tmp/filtered_blocklist && \
     mv /tmp/filtered_blocklist /etc/nft-threat-list/manual_block_list.txt
-    nft delete element inet filter threat_block { "$ip" } 2>/dev/null
+    nft delete element inet filter threat_block { $ip } 2>/dev/null
     echo "[$(date)] Removed $ip from manual block list" >> "$LOGFILE"
     msg_box "Removed" "$ip removed from manual block list and nftables."
-  elif grep -q "^$ip$" /etc/nft-threat-list/manual_block_list_v6.txt; then
-    grep -v "^$ip$" /etc/nft-threat-list/manual_block_list_v6.txt > /tmp/filtered_blocklist_v6 && \
+  elif grep -qE "^\s*${ip}\s*$" /etc/nft-threat-list/manual_block_list_v6.txt; then
+    grep -vE "^\s*${ip}\s*$" /etc/nft-threat-list/manual_block_list_v6.txt > /tmp/filtered_blocklist_v6 && \
     mv /tmp/filtered_blocklist_v6 /etc/nft-threat-list/manual_block_list_v6.txt
-    nft delete element inet filter threat_block_v6 { "$ip" } 2>/dev/null
+    nft delete element inet filter threat_block_v6 { $ip } 2>/dev/null
     echo "[$(date)] Removed $ip from manual block list (v6)" >> "$LOGFILE"
     msg_box "Removed" "$ip removed from manual v6 block list and nftables."
   else
@@ -312,34 +343,47 @@ edit_feeds() {
 run_update() {
   local TMP_LOG="/tmp/threatlist-update.log"
   local TMP_SYSLOG=$(mktemp)
+  local DEBUG_LOG="/var/log/nft-threatlist-debug.log"
   local UPDATE_TAG="nft-threat-list"
-  local START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+  local START_TIME=$(date --date='1 minute ago' '+%Y-%m-%d %H:%M:%S')
 
+  echo "[DEBUG] ===== run_update() started at $(date) =====" >> "$DEBUG_LOG"
+  echo "[DEBUG] Using THREAT_SCRIPT=$THREAT_SCRIPT" >> "$DEBUG_LOG"
   : > "$TMP_LOG"
 
-  # Start the update script in the background
-  bash "$THREAT_SCRIPT" >>"$TMP_LOG" 2>&1 &
-  local update_pid=$!
-
-  # Show a true running gauge while waiting for completion
+  # Staged, readable progress bar — script launched *inside* so we can wait safely
   {
-    local i=0
-    while kill -0 "$update_pid" 2>/dev/null; do
-      i=$(( (i + 7) % 100 ))
-      echo "$i"
-      echo "XXX"
-      echo "Updating threat list... please wait"
-      echo "XXX"
-      sleep 0.5
-    done
-    echo "100"
+    echo 10
+    echo "XXX"
+    echo "Initializing update..."
+    echo "XXX"
+    sleep 0.5
+
+    echo 30
+    echo "XXX"
+    echo "Downloading threat feeds..."
+    echo "XXX"
+    sleep 0.5
+
+    echo 50
+    echo "XXX"
+    echo "Parsing and validating IPs..."
+    echo "XXX"
+    sleep 0.5
+
+    echo 70
+    echo "XXX"
+    echo "Applying blocks to nftables..."
+    echo "XXX"
+
+    # Launch and wait inside gauge block
+    "$THREAT_SCRIPT" >"$TMP_LOG" 2>&1
+    echo 100
     echo "XXX"
     echo "Finalizing..."
     echo "XXX"
+    sleep 0.3
   } | dialog --title "Updating Threat List" --gauge "Starting..." 10 70 0
-
-  # Wait for process to fully complete
-  wait $update_pid
 
   # Pull fresh logs from journal
   journalctl -t "$UPDATE_TAG" --since "$START_TIME" --no-pager > "$TMP_SYSLOG"
@@ -356,8 +400,17 @@ run_update() {
     printf " ✅ IPv4: %s IPs | ✅ IPv6: %s IPs | ⚠️  Failed Feeds: %s\n" "$v4_count" "$v6_count" "$fail_count"
   } >> "$TMP_SYSLOG"
 
-  # Display final log with footer
   dialog --title "Threat List Update Log" --textbox "$TMP_SYSLOG" 26 105
+
+  {
+    echo ""
+    echo "[DEBUG] Last 200 lines of TMP_LOG:"
+    tail -n 200 "$TMP_LOG"
+    echo ""
+    echo "[DEBUG] Contents of TMP_SYSLOG:"
+    cat "$TMP_SYSLOG"
+    echo "[DEBUG] ===== run_update() ended at $(date) ====="
+  } >> "$DEBUG_LOG"
 
   rm -f "$TMP_SYSLOG" "$TMP_LOG"
 }
