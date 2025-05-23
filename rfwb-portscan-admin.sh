@@ -4,7 +4,7 @@ CONF_FILE="/etc/rfwb/portscan.conf"
 IGNORE_NETWORKS_FILE="/etc/nftables/ignore_networks.conf"
 IGNORE_PORTS_FILE="/etc/nftables/ignore_ports.conf"
 LOG_FILE="/var/log/rfwb-portscan.log"
-THREATLIST_ADMIN="/usr/local/bin/nft-threatlist-admin.sh"
+THREATLIST_ADMIN="/root/.rfwb-admin/nft-threat-admin.sh"
 
 EDITOR="${EDITOR:-vi}"
 
@@ -32,6 +32,80 @@ edit_file() {
 
   rm -f "$tmp" "$out"
 }
+
+# ===== View Blocked IP ====
+view_blocked_ips() {
+  tmp=$(mktemp)
+
+  {
+    echo "IPv4 Blocked:"
+    nft list set inet filter dynamic_block 2>/dev/null | grep -oP '([0-9]{1,3}\.){3}[0-9]{1,3}' || echo "(none)"
+
+    echo ""
+    echo "IPv6 Blocked:"
+    nft list set inet filter dynamic_block_v6 2>/dev/null | grep -oP '([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}' || echo "(none)"
+  } > "$tmp"
+
+  dialog --title "Blocked IPs (Dynamic)" --textbox "$tmp" 25 80
+  rm -f "$tmp"
+}
+#==== Edit Ignore Ports ====
+edit_ignore_ports_safe() {
+  local PORT_FILE="/etc/nftables/ignore_ports.conf"
+  local TMP_PORTS=$(mktemp)
+  local TMP_VALID=$(mktemp)
+  local BACKUP="${PORT_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+
+  [[ ! -f "$PORT_FILE" ]] && {
+    echo "# Enter one TCP port per line (1–65535)" > "$PORT_FILE"
+    echo "# This will be flattened into a single line for nftables" >> "$PORT_FILE"
+    echo "22" >> "$PORT_FILE"
+  }
+
+  # Expand the line to 1 port per line
+  grep -vE '^#' "$PORT_FILE" | tr ',' '\n' | sed 's/ //g' > "$TMP_PORTS"
+
+  dialog --title "Edit Ignored Ports" --editbox "$TMP_PORTS" 20 60 2>"$TMP_VALID"
+  local rc=$?
+  [[ $rc -ne 0 ]] && { msg_box "Cancelled" "No changes made."; rm -f "$TMP_PORTS" "$TMP_VALID"; return; }
+
+  local valid=true
+  local flattened=()
+
+  while IFS= read -r line; do
+    line=$(echo "$line" | xargs)  # trim
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^[0-9]{1,5}$ ]] && (( line >= 1 && line <= 65535 )); then
+      flattened+=("$line")
+    else
+      valid=false
+      break
+    fi
+  done < "$TMP_VALID"
+
+  if ! $valid; then
+    msg_box "Invalid Input" "Only port numbers 1–65535 or comments are allowed.\nNo ranges or protocols."
+    rm -f "$TMP_PORTS" "$TMP_VALID"
+    return
+  fi
+
+  # Save and re-flatten to single-line format
+  cp "$PORT_FILE" "$BACKUP"
+  IFS=,; echo "${flattened[*]}" > "$PORT_FILE"
+  unset IFS
+
+  rm -f "$TMP_PORTS" "$TMP_VALID"
+
+  # Restart service to apply changes
+  systemctl restart rfwb-portscan 2>/dev/null
+  if systemctl is-active --quiet rfwb-portscan; then
+    msg_box "Success" "Ignored ports updated.\nService restarted successfully and rules are now live."
+  else
+    msg_box "Error" "Ports saved, but rfwb-portscan failed to restart.\nCheck logs with: journalctl -u rfwb-portscan"
+  fi
+}
+
+
 
 # ===== CIDR-safe Edit for Ignore Networks (IPv4 + IPv6) =====
 edit_ignore_networks_safe() {
@@ -87,64 +161,68 @@ edit_ignore_networks_safe() {
   rm -f "$tmp" "$out" "$cleaned"
 }
 
-# ===== View Blocked IPs =====
-view_blocked_ips() {
-  tmp=$(mktemp)
-  {
-    echo "IPv4 Blocked:"
-    nft list set inet portscan dynamic_block 2>/dev/null || echo "(none)"
-    echo ""
-    echo "IPv6 Blocked:"
-    nft list set inet portscan dynamic_block_v6 2>/dev/null || echo "(none)"
-  } > "$tmp"
-  dialog --title "Blocked IPs" --textbox "$tmp" 25 80
-  rm -f "$tmp"
-}
 
 # ===== Promote to nft-threatlist =====
-promote_blocked_to_threatlist() {
-  tmp=$(mktemp)
-  {
-    echo "# IPv4"
-    nft list set inet portscan dynamic_block 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+'
-    echo "# IPv6"
-    nft list set inet portscan dynamic_block_v6 2>/dev/null | grep -oP '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+'
-  } | sort -u | grep -v '^#' > "$tmp"
 
-  if [[ ! -s "$tmp" ]]; then
-    msg_box "No IPs" "No dynamically blocked IPs found."
-    rm -f "$tmp"
+promote_blocked_to_threatlist() {
+  LOGFILE="/tmp/threatlist-promotion.log"
+  echo "[DEBUG] ===== Starting RFWB Portscan Promotion at $(date) =====" > "$LOGFILE"
+
+  THREATLIST_ADMIN="/root/.rfwb-admin/nft-threat-admin.sh"
+  [[ ! -x "$THREATLIST_ADMIN" ]] && {
+    msg_box "Error" "Threatlist admin script not found or not executable: $THREATLIST_ADMIN"
+    echo "[ERROR] Missing or non-executable: $THREATLIST_ADMIN" >> "$LOGFILE"
+    return
+  }
+
+  tmp=$(mktemp)
+  checklist=$(mktemp)
+
+  # Extract IPv4 and IPv6 IPs into checklist (no quotes)
+  {
+    nft list set inet filter dynamic_block 2>>"$LOGFILE" | grep -oP '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | while read -r ip; do
+      echo "$ip IPv4_Block off"
+    done
+    nft list set inet filter dynamic_block_v6 2>>"$LOGFILE" | grep -oP '([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}' | while read -r ip; do
+      echo "$ip IPv6_Block off"
+    done
+  } | sort -u > "$checklist"
+
+  echo "[DEBUG] Built checklist file:" >> "$LOGFILE"
+  cat "$checklist" >> "$LOGFILE"
+
+  if [[ ! -s "$checklist" ]]; then
+    msg_box "No IPs" "No dynamically blocked IPs found by rfwb-portscan."
+    echo "[DEBUG] No IPs found. Exiting." >> "$LOGFILE"
+    rm -f "$tmp" "$checklist"
     return
   fi
 
-  checklist=$(mktemp)
-  while read -r ip; do
-    echo "$ip" "" off
-  done < "$tmp" > "$checklist"
+  # Run dialog and parse user selections
+  IFS=$'\n' read -rd '' -a selected < <(dialog --separate-output --checklist \
+    "Select IPs from rfwb-portscan to promote to nft-threatlist:" 25 70 20 \
+    $(<"$checklist") 3>&1 1>&2 2>&3)
 
-  mapfile -t selected < <(dialog --separate-output --checklist "Select IPs to promote to nft-threatlist:" 25 70 20 \
-    --file "$checklist" 3>&1 1>&2 2>&3)
-
-  [[ ${#selected[@]} -eq 0 ]] && rm -f "$tmp" "$checklist" && return
+  if [[ ${#selected[@]} -eq 0 ]]; then
+    msg_box "Cancelled" "No IPs selected."
+    echo "[DEBUG] No IPs selected. Exiting." >> "$LOGFILE"
+    rm -f "$tmp" "$checklist"
+    return
+  fi
 
   for ip in "${selected[@]}"; do
-    if [[ $ip == *:* ]]; then
-      "$THREATLIST_ADMIN" --add-ip "$ip" --v6
+    if [[ "$ip" == *:* ]]; then
+      echo "[DEBUG] Promoting IPv6: $ip" >> "$LOGFILE"
+      "$THREATLIST_ADMIN" --add-ip "$ip" --v6 >> "$LOGFILE" 2>&1
     else
-      "$THREATLIST_ADMIN" --add-ip "$ip"
+      echo "[DEBUG] Promoting IPv4: $ip" >> "$LOGFILE"
+      "$THREATLIST_ADMIN" --add-ip "$ip" >> "$LOGFILE" 2>&1
     fi
   done
 
-  msg_box "Success" "Selected IPs promoted to threatlist."
+  msg_box "Success" "Selected IPs promoted to nft-threatlist."
+  echo "[DEBUG] Promotion complete." >> "$LOGFILE"
   rm -f "$tmp" "$checklist"
-}
-
-# ===== View Logs =====
-view_logs() {
-  tmp=$(mktemp)
-  journalctl -u rfwb-portscan -n 500 --no-pager > "$tmp" || echo "No logs found." > "$tmp"
-  dialog --title "rfwb-portscan Logs" --textbox "$tmp" 25 100
-  rm -f "$tmp"
 }
 
 # ===== Service Control =====
@@ -187,7 +265,7 @@ main_menu() {
       2) promote_blocked_to_threatlist ;;
       3) edit_file "$CONF_FILE" ;;
       4) edit_ignore_networks_safe ;;
-      5) edit_file "$IGNORE_PORTS_FILE" ;;
+      5) edit_ignore_ports_safe ;;
       6) view_logs ;;
       7) service_control ;;
       8|*) clear; exit 0 ;;
