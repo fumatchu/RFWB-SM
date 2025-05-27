@@ -6,6 +6,7 @@ declare -A SERVICE_ADMIN_TOOLS=(
   [kea-dhcp4.service]="/root/.rfwb-admin/dhcp-admin.sh"
   [kea-dhcp-ddns.service]="/root/.rfwb-admin/dhcp-admin.sh"
   [suricata.service]="/root/.rfwb-admin/suricata-admin.sh"
+  [rfwb-portscan.service]="/root/.rfwb-admin/rfwb-portscan-admin.sh"
   # Add more as needed
 )
 
@@ -22,7 +23,6 @@ CANDIDATE_UNITS=(
   named.service
   openvpn-server@server.service
   rfwb-portscan.service
-  rfwb-ps-mon.service
   snmpd.service
   sshd.service
   suricata.service
