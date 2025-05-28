@@ -162,4 +162,3 @@ Name: $friendly_name"
     esac
   done
 }
-vlan_main
