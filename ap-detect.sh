@@ -2,7 +2,7 @@
 
 # dialog-based Wi-Fi Access Point Testing Script (RFWB-Setup)
 
-set -euo pipefail
+#set -euo pipefail
 
 TEMP_INPUT=$(mktemp)
 LOGFILE="/tmp/hostapd-test.log"
@@ -96,13 +96,11 @@ else
 fi
 
 # Step 9: Ask user if they see the SSID
-if [[ "$PROBE_RESULT" == "success" ]]; then
-    yesno_box "SSID Detection" "Probe requests detected!\n\nPlease check your Wi-Fi from another device.\nYou should see an SSID named: RFWB-Setup\n\nDo you see it?"
-    SEEN=$?
-else
-    msg_box "No Probes" "No probe requests detected.\n\nCheck the logs:\n$LOGFILE"
-    SEEN=1
-fi
+# Step 9: Ask user if they see the SSID
+dialog --title "SSID Detection" \
+  --yesno "Please check your Wi-Fi from another device.\n\nYou should see an SSID named: RFWB-Setup\n\nDo you see it?" 12 60
+
+USER_SEES_SSID=$?  # 0 = Yes, 1 = No
 
 # Step 10: Cleanup
 info_box "Stopping hostapd and cleaning up..."
@@ -117,10 +115,12 @@ iw dev "$WIFI_IFACE" set type managed
 ip link set "$WIFI_IFACE" up
 
 # Final status
-if [[ $SEEN -eq 0 ]]; then
-    msg_box "Success" "Test SSID RFWB-Setup detected!\n\nSystem is ready for full AP setup."
-    exit 0
+# Final status
+if [[ "$USER_SEES_SSID" -eq 0 ]]; then
+  msg_box "Success" "Test SSID RFWB-Setup detected!\n\nSystem is ready for full AP setup."
 else
-    msg_box "Test Failed" "SSID not visible or probe failed.\n\nCheck wireless hardware and retry."
-    exit 1
+  msg_box "Test Failed" "You reported that the SSID was not visible.\n\nWi-Fi setup was unsuccessful."
+
+  msg_box "Manual Setup Required" \
+  "Unfortunately, we were not able to configure your radio hardware for Wi-Fi.\n\nIf you would still like to use Wi-Fi, you must set it up manually using NetworkManager or nmtui."
 fi
