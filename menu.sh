@@ -13,7 +13,7 @@ declare -A MODULE_PATHS=(
 )
 
 declare -A MODULE_SCRIPTS=(
-  [INTERFACES]="/root/.rfwb-admin/interface-management.sh"
+  [INTERFACES]="/root/.rfwb-admin/interface-admin.sh"
   [QOS]="/root/.rfwb-admin/qos-admin.sh"
   [DHCP]="/root/.rfwb-admin/dhcp-admin.sh"
   [DNS]="/root/.rfwb-admin/dns-admin.sh"
