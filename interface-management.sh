@@ -1,6 +1,8 @@
 #!/bin/bash
 
 source /root/.rfwb-admin/lib.sh
+source /root/.rfwb-admin/vlan-admin.sh  # Add this line to include your VLAN logic
+
 reset_backtitle
 add_to_backtitle "Interfaces"
 
@@ -12,7 +14,8 @@ interfaces_admin_menu() {
       --menu "Select an option:" 15 60 6 \
       1 "Launch nmtui (then restart rfwb-portscan)" \
       2 "Guest Network Setup" \
-      3 "Back to Main Menu" \
+      3 "VLAN Management" \
+      4 "Back to Main Menu" \
       3>&1 1>&2 2>&3)
 
     case "$CHOICE" in
@@ -25,7 +28,10 @@ interfaces_admin_menu() {
       2)
         guest_network_menu
         ;;
-      3|"")
+      3)
+        vlan_main
+        ;;
+      4|"")
         break
         ;;
     esac
