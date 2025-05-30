@@ -319,5 +319,115 @@ else
 fi
 
 done
+add_wifi_subnet_to_kea() {
+  local cidr="$1" iface="$2" domain="$3"
+  local kea_config="/etc/kea/kea-dhcp4.conf"
 
+  local iface_ip pool_start pool_end base_net id desc fqdn
+  iface_ip=$(nmcli -g IP4.ADDRESS device show "$iface" | awk -F/ '{print $1}')
+  base_net=$(echo "$cidr" | cut -d/ -f1 | awk -F. '{printf "%s.%s.%s", $1, $2, $3}')
+  pool_start="${base_net}.10"
+  pool_end="${base_net}.200"
+  desc="Wi-Fi Subnet ($cidr)"
+
+  id=$(jq '[.Dhcp4.subnet4[].id] | max + 1' "$kea_config" 2>/dev/null || echo 1)
+  [[ -z "$id" || "$id" == "null" ]] && id=1
+  fqdn=$(hostnamectl status | awk '/Static hostname:/ {print $3}')
+
+  local options subnet tmpconf
+  options=$(jq -n --arg r "$iface_ip" --arg d "$iface_ip" --arg dom "$domain" '[
+    { "name": "routers", "data": $r },
+    { "name": "domain-name-servers", "data": $d },
+    { "name": "ntp-servers", "data": $d },
+    { "name": "domain-search", "data": $dom },
+    { "name": "domain-name", "data": $dom }
+  ]')
+
+  subnet=$(jq -n --argjson id "$id" --arg cidr "$cidr" --arg desc "$desc" \
+                  --arg pool_start "$pool_start" --arg pool_end "$pool_end" \
+                  --arg iface "$iface" --argjson opts "$options" '{
+    id: $id,
+    subnet: $cidr,
+    comment: $desc,
+    interface: $iface,
+    pools: [ { pool: ($pool_start + " - " + $pool_end) } ],
+    "option-data": $opts
+  }')
+
+  tmpconf=$(mktemp)
+  jq --argjson sn "$subnet" '.Dhcp4.subnet4 += [$sn]' "$kea_config" > "$tmpconf" && mv "$tmpconf" "$kea_config"
+  chown kea:kea "$kea_config"
+  chmod 640 "$kea_config"
+  restorecon "$kea_config"
+
+  kea-dhcp4 -t "$kea_config" || {
+    msg_box "Error" "KEA config test failed."
+    return 1
+  }
+}
+
+add_reverse_zone_for_wifi() {
+  local cidr="$1" iface_ip="$2" domain="$3"
+  local kea_ddns="/etc/kea/kea-dhcp-ddns.conf"
+  local named_conf="/etc/named.conf"
+  local zone_dir="/var/named"
+
+  local rev_zone zone_name_ddns zone_name_bind zone_file fqdn last_octet
+  rev_zone=$(echo "${cidr%.*}" | awk -F. '{print $3"."$2"."$1}')
+  zone_name_ddns="${rev_zone}.in-addr.arpa."
+  zone_name_bind="${rev_zone}.in-addr.arpa"
+  zone_file="$zone_dir/db.${rev_zone}"
+  fqdn=$(hostnamectl status | awk '/Static hostname:/ {print $3}')
+  last_octet=$(echo "$iface_ip" | awk -F. '{print $4}')
+
+  if ! jq -e --arg z "$zone_name_ddns" '.DhcpDdns["reverse-ddns"]["ddns-domains"][]? | select(.name == $z)' "$kea_ddns" >/dev/null; then
+    tmpddns=$(mktemp)
+    jq --arg z "$zone_name_ddns" '.DhcpDdns["reverse-ddns"]["ddns-domains"] += [{
+      "name": $z,
+      "key-name": "Kea-DDNS",
+      "dns-servers": [ { "ip-address": "127.0.0.1", "port": 53 } ]
+    }]' "$kea_ddns" > "$tmpddns"
+    mv "$tmpddns" "$kea_ddns"
+    chown kea:kea "$kea_ddns"
+    chmod 640 "$kea_ddns"
+    restorecon "$kea_ddns"
+  fi
+
+  if ! grep -q "zone \"$zone_name_bind\"" "$named_conf"; then
+    cat >> "$named_conf" <<EOF
+
+zone "$zone_name_bind" {
+  type master;
+  file "$zone_file";
+  allow-update { key "Kea-DDNS"; };
+};
+EOF
+  fi
+
+  if [[ ! -f "$zone_file" ]]; then
+    cat > "$zone_file" <<EOF
+\$TTL 86400
+@   IN  SOA   ${fqdn}. admin.${domain}. (
+    $(date +%Y%m%d01) ; serial
+    3600       ; refresh
+    1800       ; retry
+    604800     ; expire
+    86400 )    ; minimum
+@   IN  NS    ${fqdn}.
+$last_octet  IN PTR ${fqdn}.
+EOF
+    chown named:named "$zone_file"
+    chmod 640 "$zone_file"
+    restorecon "$zone_file"
+  fi
+
+  systemctl restart kea-dhcp-ddns named
+}
+
+iface_ip=$(nmcli -g IP4.ADDRESS device show "$BRIDGE_NAME" | awk -F/ '{print $1}')
+fqdn=$(hostnamectl status | awk '/Static hostname:/ {print $3}')
+domain="${fqdn#*.}"
+
+add_wifi_subnet_to_kea "$CIDR" "$BRIDGE_NAME" "$domain"
+add_reverse_zone_for_wifi "$CIDR" "$iface_ip" "$domain"
 msg_box "Wi-Fi Ready" "Access point and VLAN bridge configured successfully."
