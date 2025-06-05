@@ -50,7 +50,7 @@ interfaces_admin_menu() {
         ;;
       4)
         if [[ -n "$WIFI_IFACE" ]]; then
-          /root/.rfwb-admin/ap-detect.sh
+          /root/.rfwb-admin/wifi-admin.sh
         else
           break
         fi
