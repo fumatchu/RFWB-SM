@@ -19,7 +19,7 @@ info_box()   { dialog --infobox "$1" 5 60; sleep 2; }
 dialog --title "Wi-Fi AP Test" --infobox "Initializing Wi-Fi Access Point Testing..." 5 50
 sleep 1
 
-REQUIRED_PKGS=("hostapd" "iw" "iproute" "bridge-utils" "lshw")
+REQUIRED_PKGS=("hostapd" "iw" "iproute" "bridge-utils" "lshw" "pciutils")
 MISSING_PKGS=()
 
 for pkg in "${REQUIRED_PKGS[@]}"; do
