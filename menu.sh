@@ -13,6 +13,7 @@ declare -A MODULE_PATHS=(
 )
 
 declare -A MODULE_SCRIPTS=(
+  [USERADMIN]="/root/.rfwb-admin/user-admin.sh"
   [INTERFACES]="/root/.rfwb-admin/interface-admin.sh"
   [QOS]="/root/.rfwb-admin/qos-admin.sh"
   [DHCP]="/root/.rfwb-admin/dhcp-admin.sh"
@@ -24,6 +25,7 @@ declare -A MODULE_SCRIPTS=(
 )
 
 declare -A MODULE_DESCRIPTIONS=(
+  [USERADMIN]="Administer User Access"
   [INTERFACES]="Configure Ethernet/Wireless and guest networks"
   [QOS]="Manage QoS traffic shaping"
   [DHCP]="Configure Kea DHCP server"
@@ -60,7 +62,10 @@ build_main_menu() {
 
   local menu=()
 
-  menu=( "INTERFACES" "${MODULE_DESCRIPTIONS[INTERFACES]}" )
+  # Static entries
+  menu+=( "USERADMIN" "${MODULE_DESCRIPTIONS[USERADMIN]}" )
+  menu+=( "INTERFACES" "${MODULE_DESCRIPTIONS[INTERFACES]}" )
+  
 
   for module in "${!MODULE_PATHS[@]}"; do
     if [[ -e "${MODULE_PATHS[$module]}" && -f "${MODULE_SCRIPTS[$module]}" ]]; then
